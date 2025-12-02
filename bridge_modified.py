@@ -812,7 +812,7 @@ st.session_state.session_log.append({
     }
 })
     
-    return pd.DataFrame(results)
+return pd.DataFrame(results)
 
 
 def train_model(data: pd.DataFrame) -> Tuple:
