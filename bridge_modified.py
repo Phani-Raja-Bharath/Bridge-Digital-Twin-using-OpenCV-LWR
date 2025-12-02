@@ -18,7 +18,7 @@ import base64
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Optional imports
+
 try:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -84,7 +84,7 @@ VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
 
 
 # =============================================================================
-# WEATHER API (Open-Meteo - Free, No API Key)
+# WEATHER API (Open-Meteo - Free)
 # =============================================================================
 
 def fetch_weather(lat: float, lon: float) -> Dict:
@@ -245,6 +245,125 @@ def analyze_historical_weather(df: pd.DataFrame) -> Dict:
         "seasonal_data": seasonal
     }
 
+def generate_training_data_from_historical(
+    historical_df: pd.DataFrame,
+    road_length_m: float = 237.4,
+    scenarios_per_day: int = 5
+) -> pd.DataFrame:
+    """
+    Generate ML training data by combining historical weather with traffic scenarios.
+    
+    This is the RIGHT approach:
+    - Historical weather provides REAL environmental conditions
+    - Traffic scenarios simulate various load conditions
+    - Combined fatigue is calculated for each combination
+    - RF learns the relationship between (weather + traffic) → fatigue
+    
+    Returns DataFrame with features and target for ML training.
+    """
+    
+    if historical_df is None or len(historical_df) == 0:
+        logger.warning("No historical data for training")
+        return pd.DataFrame()
+    
+    training_records = []
+    
+    for _, weather_row in historical_df.iterrows():
+        # Extract weather features for this day
+        temp = weather_row.get("temp_max", 15)
+        temp_min = weather_row.get("temp_min", 10)
+        precip = weather_row.get("precipitation", 0) or 0
+        wind = weather_row.get("wind_max", 10) or 10
+        freeze_thaw = weather_row.get("freeze_thaw", 0)
+        snowfall = weather_row.get("snowfall", 0) or 0
+        
+        # Derived features
+        date = weather_row.get("date", datetime.now())
+        month = date.month if hasattr(date, 'month') else 6
+        is_winter = 1 if month in [11, 12, 1, 2, 3] else 0
+        temp_range = abs(temp - temp_min)
+        
+        # Salt exposure: precipitation when cold
+        salt_exposure = precip * 3.0 if (is_winter and temp < 5) else precip * 0.5
+        
+        # Generate multiple traffic scenarios for this weather day
+        for _ in range(scenarios_per_day):
+            # Random traffic conditions
+            density = np.random.uniform(0.02, 0.15)  # vehicles/meter
+            v_max = np.random.choice([60, 80, 100, 120]) / 3.6  # km/h to m/s
+            truck_pct = np.random.uniform(0.10, 0.25)
+            
+            # Run LWR simulation
+            sim_result = run_lwr_simulation(
+                initial_density=density,
+                road_length_m=road_length_m,
+                v_max_mps=v_max,
+                inject_jam=np.random.random() < 0.3
+            )
+            
+            # Calculate traffic stress (from simulation)
+            traffic_stress = sim_result["fatigue"]
+            shockwave = sim_result["shockwave_speed"]
+            
+            # Calculate environmental stress (weather-based)
+            # Using actual formulas, not hardcoded
+            freeze_thaw_stress = min(100, freeze_thaw * 30)  # Each F/T cycle adds stress
+            humidity_stress = 50  # Assumed average, could enhance with humidity data
+            temp_stress = 20 + abs(temp - 15) * 2 + temp_range * 1.5
+            temp_stress = min(100, temp_stress)
+            precip_stress = min(100, salt_exposure * 5)
+            wind_stress = min(100, wind * 2)
+            
+            # Combined environmental (weighted)
+            env_stress = (
+                freeze_thaw_stress * 0.30 +
+                humidity_stress * 0.15 +
+                temp_stress * 0.20 +
+                precip_stress * 0.25 +
+                wind_stress * 0.10
+            )
+            
+            # Age factor (Twin Bridges = 66 years)
+            age_factor = 1.16  # 1.0 + (66-50)*0.01
+            env_stress *= age_factor
+            env_stress = min(100, env_stress)
+            
+            # Combined fatigue target (what RF will learn to predict)
+            combined_fatigue = traffic_stress * 0.7 + env_stress * 0.3
+            combined_fatigue = min(100, combined_fatigue)
+            
+            # Store training record
+            training_records.append({
+                # Traffic features
+                "density": round(density, 4),
+                "v_max": round(v_max * 3.6, 1),  # Back to km/h
+                "truck_pct": round(truck_pct, 2),
+                "shockwave_speed": round(shockwave, 4),
+                
+                # Weather features (REAL historical data)
+                "temperature": round(temp, 1),
+                "temp_min": round(temp_min, 1),
+                "temp_range": round(temp_range, 1),
+                "precipitation": round(precip, 1),
+                "snowfall": round(snowfall, 1),
+                "wind_speed": round(wind, 1),
+                "freeze_thaw": freeze_thaw,
+                "salt_exposure": round(salt_exposure, 1),
+                "month": month,
+                "is_winter": is_winter,
+                
+                # Intermediate calculations (for debugging)
+                "traffic_stress": round(traffic_stress, 2),
+                "env_stress": round(env_stress, 2),
+                
+                # TARGET
+                "fatigue": round(combined_fatigue, 2)
+            })
+    
+    df = pd.DataFrame(training_records)
+    logger.info(f"Generated {len(df)} training samples from {len(historical_df)} days × {scenarios_per_day} scenarios")
+    
+    return df
 
 def calculate_environmental_stress(
     temperature: float,
@@ -637,46 +756,191 @@ def run_monte_carlo(
         # Probabilistic jam injection
         inject_jam = np.random.random() < inject_jam_probability
         
-        sim = run_lwr_simulation(density, road_length_m, v_max, inject_jam=inject_jam)
-        
-        results.append({
-            "density": density,
-            "v_max": v_max * 3.6,
-            "alpha": alpha,
-            "shockwave_speed": sim["shockwave_speed"],
-            "fatigue": sim["fatigue"] * (alpha / 0.0001),
-            "jam_injected": inject_jam
-        })
+sim = run_lwr_simulation(
+    initial_density=vehicle_data.get("density", 0.03),
+    road_length_m=bridge_config.total_length_m,
+    v_max_mps=22.2
+)
+
+# Compute fatigue damage using Miner's Rule
+damage, mu_S, sigma_S = compute_fatigue_damage(sim["stress_history"])
+
+# Compute reliability index β
+beta = compute_reliability_index(mu_S=mu_S, sigma_S=sigma_S)
+
+# Get truck percentage
+approaching = vehicle_data.get("approaching", {})
+total = approaching.get("total", 1)
+trucks = approaching.get("truck", 0)
+truck_pct = trucks / total if total > 0 else 0.15
+
+# PREDICT using trained model with CURRENT weather + traffic
+if st.session_state.rf_model is not None:
+    predicted_fatigue, _ = predict_fatigue_with_weather(
+        model=st.session_state.rf_model,
+        density=vehicle_data.get("density", 0.03),
+        shockwave=sim["shockwave_speed"],
+        truck_pct=truck_pct,
+        temperature=st.session_state.weather.get("temperature", 15),
+        precipitation=st.session_state.weather.get("precipitation", 0),
+        wind_speed=st.session_state.weather.get("wind_speed", 10),
+        freeze_thaw=st.session_state.weather.get("freeze_thaw_7day", 0),
+        month=datetime.now().month
+    )
+else:
+    predicted_fatigue = sim["fatigue"]
+
+# Include in log
+frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+pil_img = Image.fromarray(frame_rgb)
+buffer = io.BytesIO()
+pil_img.save(buffer, format="JPEG", quality=80)
+img_b64 = base64.b64encode(buffer.getvalue()).decode()
+
+st.session_state.session_log.append({
+    "timestamp": datetime.now(),
+    "vehicle_data": vehicle_data,
+    "image_b64": img_b64,
+    "damage": round(damage, 6),
+    "reliability_index": round(beta, 2),
+    "predicted_fatigue": round(predicted_fatigue, 2),  # NEW
+    "weather_used": {  # NEW - track what weather was used
+        "temp": st.session_state.weather.get("temperature"),
+        "precip": st.session_state.weather.get("precipitation"),
+        "wind": st.session_state.weather.get("wind_speed"),
+        "freeze_thaw": st.session_state.weather.get("freeze_thaw_7day")
+    }
+})
     
     return pd.DataFrame(results)
 
 
 def train_model(data: pd.DataFrame) -> Tuple:
-    """Train Random Forest model"""
+    """
+    Train Random Forest model on historical weather + traffic data.
+    
+    Features include both traffic AND weather variables.
+    Model learns the combined effect, not just traffic alone.
+    """
     
     if not SKLEARN_AVAILABLE or len(data) < 20:
+        logger.warning(f"Cannot train: sklearn={SKLEARN_AVAILABLE}, samples={len(data)}")
         return None, {}
     
-    features = ["density", "v_max", "alpha", "shockwave_speed"]
-    X = data[features]
+    # Define features - NOW INCLUDES WEATHER
+    traffic_features = ["density", "v_max", "shockwave_speed", "truck_pct"]
+    weather_features = ["temperature", "temp_range", "precipitation", "wind_speed", 
+                        "freeze_thaw", "salt_exposure", "month", "is_winter"]
+    
+    # Use available features
+    available_features = [f for f in traffic_features + weather_features if f in data.columns]
+    
+    if len(available_features) < 4:
+        logger.warning(f"Not enough features: {available_features}")
+        return None, {}
+    
+    X = data[available_features]
     y = data["fatigue"]
     
+    # Split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
+    # Train
     model = RandomForestRegressor(n_estimators=100, max_depth=15, random_state=42)
     model.fit(X_train, y_train)
     
+    # Evaluate
     y_pred = model.predict(X_test)
+    
+    # Feature importance
+    importance_dict = dict(zip(available_features, model.feature_importances_))
+    sorted_importance = dict(sorted(importance_dict.items(), key=lambda x: x[1], reverse=True))
     
     metrics = {
         "r2": r2_score(y_test, y_pred),
         "mae": mean_absolute_error(y_test, y_pred),
-        "feature_importance": dict(zip(features, model.feature_importances_)),
+        "feature_importance": sorted_importance,
+        "features_used": available_features,
+        "training_samples": len(X_train),
+        "test_samples": len(X_test),
         "y_test": y_test,
         "y_pred": y_pred
     }
     
+    # DEBUG OUTPUT
+    logger.info("=" * 50)
+    logger.info("MODEL TRAINING COMPLETE")
+    logger.info(f"Training samples: {len(X_train)}")
+    logger.info(f"Test samples: {len(X_test)}")
+    logger.info(f"Features: {available_features}")
+    logger.info(f"R² Score: {metrics['r2']:.3f}")
+    logger.info(f"MAE: {metrics['mae']:.3f}")
+    logger.info("Top 5 Feature Importance:")
+    for i, (feat, imp) in enumerate(list(sorted_importance.items())[:5]):
+        logger.info(f"  {i+1}. {feat}: {imp:.3f}")
+    logger.info("=" * 50)
+    
     return model, metrics
+
+
+def predict_fatigue_with_weather(
+    model,
+    density: float,
+    shockwave: float,
+    truck_pct: float,
+    temperature: float,
+    precipitation: float,
+    wind_speed: float,
+    freeze_thaw: int,
+    month: int
+) -> Tuple[float, Dict]:
+    """
+    Predict fatigue using BOTH current traffic AND current weather.
+    
+    This is real-time inference using the trained model.
+    """
+    
+    if model is None:
+        # Fallback to simple calculation
+        return density * 100, {"method": "fallback"}
+    
+    # Derived features
+    is_winter = 1 if month in [11, 12, 1, 2, 3] else 0
+    temp_range = 10  # Assumed average daily range
+    salt_exposure = precipitation * 3.0 if (is_winter and temperature < 5) else precipitation * 0.5
+    
+    # Build feature vector
+    features = {
+        "density": density,
+        "v_max": 80,  # Default assumption
+        "shockwave_speed": shockwave,
+        "truck_pct": truck_pct,
+        "temperature": temperature,
+        "temp_range": temp_range,
+        "precipitation": precipitation,
+        "wind_speed": wind_speed,
+        "freeze_thaw": freeze_thaw,
+        "salt_exposure": salt_exposure,
+        "month": month,
+        "is_winter": is_winter
+    }
+    
+    # Create DataFrame with same columns as training
+    X = pd.DataFrame([features])
+    
+    # Get available features (model might have been trained with subset)
+    try:
+        model_features = model.feature_names_in_
+        X = X[model_features]
+    except AttributeError:
+        pass
+    
+    prediction = model.predict(X)[0]
+    
+    logger.info(f"PREDICTION - Density: {density:.4f}, Temp: {temperature}°C, "
+                f"Precip: {precipitation}mm, F/T: {freeze_thaw} → Fatigue: {prediction:.1f}")
+    
+    return prediction, features
 
 
 def predict_fatigue(
@@ -1849,30 +2113,77 @@ def main():
     
     if st.button("🔬 ANALYZE BASELINE CONDITIONS", type="primary", use_container_width=True):
         
-        with st.spinner("Running analysis..."):
+        with st.spinner("Running analysis with historical weather training..."):
             progress = st.progress(0)
             
-            # Get current density
-            density = st.session_state.vehicle_data.get("density", 0.03)
+            # Step 1: Fetch historical weather for training
+            progress.progress(10, "Fetching historical weather data...")
+            hist_df = fetch_historical_weather(bridge_config.latitude, bridge_config.longitude, months=12)
             
-            # Monte Carlo
-            progress.progress(20, "Running Monte Carlo simulation...")
-            mc_data = run_monte_carlo(mc_runs, bridge_config.total_length_m, density, jam_probability)
-            st.session_state.mc_data = mc_data
+            if hist_df is None or len(hist_df) == 0:
+                st.error("Failed to fetch historical weather. Using fallback.")
+                hist_df = None
+            else:
+                st.session_state.historical_weather = hist_df
+                st.session_state.historical_analysis = analyze_historical_weather(hist_df)
             
-            # Train model
-            progress.progress(50, "Training ML model...")
-            model, metrics = train_model(mc_data)
+            # Step 2: Generate training data from historical weather + traffic scenarios
+            progress.progress(30, "Generating training data from historical patterns...")
+            
+            if hist_df is not None:
+                training_data = generate_training_data_from_historical(
+                    hist_df, 
+                    road_length_m=bridge_config.total_length_m,
+                    scenarios_per_day=5  # 365 days × 5 = ~1825 training samples
+                )
+                st.session_state.mc_data = training_data
+            else:
+                # Fallback to simple Monte Carlo
+                density = st.session_state.vehicle_data.get("density", 0.03)
+                training_data = run_monte_carlo(mc_runs, bridge_config.total_length_m, density, jam_probability)
+                st.session_state.mc_data = training_data
+            
+            # Step 3: Train model on historical + traffic data
+            progress.progress(50, "Training ML model on historical patterns...")
+            model, metrics = train_model(training_data)
             st.session_state.rf_model = model
             st.session_state.rf_metrics = metrics
             
-            # Predict traffic fatigue
-            progress.progress(70, "Calculating fatigue...")
-            traffic_fatigue = predict_fatigue(model, density, mc_data["shockwave_speed"].mean())
+            # Step 4: Predict using CURRENT weather + CURRENT traffic
+            progress.progress(70, "Predicting with current conditions...")
+            
+            density = st.session_state.vehicle_data.get("density", 0.03)
+            weather = st.session_state.weather
+            
+            # Calculate shockwave from current density
+            current_sim = run_lwr_simulation(
+                initial_density=density,
+                road_length_m=bridge_config.total_length_m,
+                v_max_mps=22.2
+            )
+            
+            # Get current truck percentage from detection
+            approaching = st.session_state.vehicle_data.get("approaching", {})
+            total = approaching.get("total", 1)
+            trucks = approaching.get("truck", 0)
+            truck_pct = trucks / total if total > 0 else 0.15
+            
+            # REAL-TIME PREDICTION using both traffic AND weather
+            traffic_fatigue, used_features = predict_fatigue_with_weather(
+                model=model,
+                density=density,
+                shockwave=current_sim["shockwave_speed"],
+                truck_pct=truck_pct,
+                temperature=weather.get("temperature", 15),
+                precipitation=weather.get("precipitation", 0),
+                wind_speed=weather.get("wind_speed", 10),
+                freeze_thaw=weather.get("freeze_thaw_7day", 0),
+                month=datetime.now().month
+            )
+            
             st.session_state.baseline_traffic_fatigue = traffic_fatigue
             
-            # Environmental stress
-            weather = st.session_state.weather
+            # Environmental stress (for display breakdown)
             env_stress = calculate_environmental_stress(
                 weather["temperature"],
                 weather["humidity"],
@@ -1889,7 +2200,39 @@ def main():
             time.sleep(0.3)
             progress.empty()
         
+        # DEBUG OUTPUT IN UI
         st.success("✅ Baseline analysis complete!")
+        
+        # Show training info
+        if st.session_state.rf_metrics:
+            metrics = st.session_state.rf_metrics
+            with st.expander("🔍 DEBUG: Model Training Details", expanded=True):
+                col_d1, col_d2, col_d3 = st.columns(3)
+                with col_d1:
+                    st.metric("Training Samples", metrics.get("training_samples", "N/A"))
+                with col_d2:
+                    st.metric("R² Score", f"{metrics.get('r2', 0):.3f}")
+                with col_d3:
+                    st.metric("MAE", f"{metrics.get('mae', 0):.2f}")
+                
+                st.markdown("**Features Used:**")
+                st.write(metrics.get("features_used", []))
+                
+                st.markdown("**Feature Importance (Top 5):**")
+                importance = metrics.get("feature_importance", {})
+                for i, (feat, imp) in enumerate(list(importance.items())[:5]):
+                    st.write(f"{i+1}. **{feat}**: {imp:.3f}")
+                
+                st.markdown("**Current Conditions Used for Prediction:**")
+                st.json({
+                    "density": round(density, 4),
+                    "truck_pct": round(truck_pct, 2),
+                    "temperature": weather.get("temperature"),
+                    "precipitation": weather.get("precipitation"),
+                    "wind_speed": weather.get("wind_speed"),
+                    "freeze_thaw": weather.get("freeze_thaw_7day"),
+                    "month": datetime.now().month
+                })
     
     # =========================================================================
     # SCENARIO DASHBOARD
