@@ -82,6 +82,98 @@ CAMERAS = {
 VEHICLE_WEIGHTS = {'car': 4000, 'truck': 35000, 'bus': 25000, 'motorcycle': 500}
 VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
 
+# =============================================================================
+# ROI (Region of Interest) CONFIGURATION
+# =============================================================================
+
+# Default ROI box as percentage of frame [x1%, y1%, x2%, y2%]
+# This defines the "bridge deck" area where vehicles are counted
+DEFAULT_ROI = {
+    "5821 - North of Mohawk": {
+        "x1_pct": 0.20,  # Left edge (20% from left)
+        "y1_pct": 0.35,  # Top edge (35% from top)
+        "x2_pct": 0.80,  # Right edge (80% from left)
+        "y2_pct": 0.75,  # Bottom edge (75% from top)
+    },
+    "3645 - South of Mohawk": {
+        "x1_pct": 0.15,
+        "y1_pct": 0.30,
+        "x2_pct": 0.85,
+        "y2_pct": 0.70,
+    }
+}
+
+# Camera calibration for distance estimation
+# Based on typical DOT camera specs and lane widths
+CAMERA_CALIBRATION = {
+    "focal_length_px": 800,       # Estimated focal length in pixels
+    "typical_car_width_m": 1.8,   # Average car width
+    "typical_truck_width_m": 2.5, # Average truck width
+    "lane_width_m": 3.6,          # Standard lane width
+    "camera_height_m": 10,        # Estimated camera mounting height
+    "camera_fov_deg": 60,         # Approximate field of view
+}
+
+
+def estimate_vehicle_distance(
+    bbox_width_px: int,
+    frame_width_px: int,
+    vehicle_type: str = "car"
+) -> Dict:
+    """
+    Estimate distance to vehicle based on bounding box size.
+    
+    Uses pinhole camera model:
+    distance = (real_width × focal_length) / bbox_width
+    
+    Returns dict with distance estimate and confidence.
+    """
+    
+    # Get real-world width based on vehicle type
+    if vehicle_type == "truck":
+        real_width = CAMERA_CALIBRATION["typical_truck_width_m"]
+    elif vehicle_type == "bus":
+        real_width = 2.5
+    else:
+        real_width = CAMERA_CALIBRATION["typical_car_width_m"]
+    
+    # Estimate focal length from FOV if not calibrated
+    fov_rad = np.radians(CAMERA_CALIBRATION["camera_fov_deg"])
+    focal_length = (frame_width_px / 2) / np.tan(fov_rad / 2)
+    
+    # Calculate distance
+    if bbox_width_px > 10:
+        distance_m = (real_width * focal_length) / bbox_width_px
+    else:
+        distance_m = 999  # Invalid
+    
+    # Estimate angle from center
+    # (This would need bbox center_x, adding as placeholder)
+    
+    # Confidence based on bbox size (larger = more confident)
+    confidence = min(1.0, bbox_width_px / 100)
+    
+    return {
+        "distance_m": round(distance_m, 1),
+        "confidence": round(confidence, 2),
+        "method": "pinhole_model"
+    }
+
+
+def get_roi_pixels(frame_shape: Tuple, roi_pct: Dict) -> Tuple[int, int, int, int]:
+    """Convert ROI percentages to pixel coordinates"""
+    height, width = frame_shape[:2]
+    x1 = int(width * roi_pct["x1_pct"])
+    y1 = int(height * roi_pct["y1_pct"])
+    x2 = int(width * roi_pct["x2_pct"])
+    y2 = int(height * roi_pct["y2_pct"])
+    return x1, y1, x2, y2
+
+
+def is_in_roi(center_x: int, center_y: int, roi: Tuple[int, int, int, int]) -> bool:
+    """Check if point is inside ROI box"""
+    x1, y1, x2, y2 = roi
+    return x1 <= center_x <= x2 and y1 <= center_y <= y2
 
 # =============================================================================
 # WEATHER API (Open-Meteo - Free)
@@ -525,37 +617,65 @@ def detect_vehicles(
     frame: np.ndarray,
     model,
     camera_config: Dict,
+    camera_name: str,
     lane_divider: float = 0.43,
     confidence: float = 0.15,
     bridge_config: BridgeConfig = None,
-    vehicle_weights: Dict = None
-) -> Tuple[Dict, np.ndarray]:
-     
-    if frame is None or model is None:
-        return {}, frame
+    use_roi: bool = True,
+    roi_override: Dict = None
+) -> Tuple[Dict, np.ndarray, list]:
+    """
+    Detect vehicles with ROI box and distance estimation.
     
-    # Use passed weights or default
-    weights = vehicle_weights if vehicle_weights else VEHICLE_WEIGHTS
+    Returns:
+        - vehicle_data: counts and statistics
+        - output_frame: annotated frame
+        - detections: list of individual detection details (for analysis)
+    """
+    
+    if frame is None or model is None:
+        return {}, frame, []
     
     try:
         output_frame = frame.copy()
         height, width = frame.shape[:2]
-        divider_x = int(width * lane_divider)
         approaching_side = camera_config["approaching_side"]
+        
+        # Get ROI
+        if roi_override:
+            roi_pct = roi_override
+        elif camera_name in DEFAULT_ROI:
+            roi_pct = DEFAULT_ROI[camera_name]
+        else:
+            # Fallback to full frame with divider
+            roi_pct = {"x1_pct": 0.0, "y1_pct": 0.0, "x2_pct": 1.0, "y2_pct": 1.0}
+        
+        roi_pixels = get_roi_pixels(frame.shape, roi_pct)
+        roi_x1, roi_y1, roi_x2, roi_y2 = roi_pixels
+        
+        # Draw ROI box (blue, semi-transparent effect via dashed line)
+        if use_roi:
+            # Draw ROI rectangle
+            cv2.rectangle(output_frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (255, 165, 0), 2)
+            cv2.putText(output_frame, "ROI", (roi_x1 + 5, roi_y1 + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+        
+        # Lane divider (within ROI)
+        divider_x = int(width * lane_divider)
+        cv2.line(output_frame, (divider_x, roi_y1), (divider_x, roi_y2), (0, 200, 255), 2)
         
         # Initialize counts
         vehicle_data = {
             "approaching": {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0, "total": 0},
             "leaving": {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0, "total": 0},
+            "in_roi": {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0, "total": 0},
+            "outside_roi": 0,
         }
-
-
+        
+        detections = []  # Store individual detections for analysis
         
         # Run YOLO
         results = model(frame, conf=confidence, iou=0.45, verbose=False, classes=[2, 3, 5, 7])
-        
-        # Draw lane divider (subtle)
-        cv2.line(output_frame, (divider_x, 0), (divider_x, height), (0, 200, 255), 2)
         
         # Process detections
         for result in results:
@@ -563,12 +683,46 @@ def detect_vehicles(
                 class_id = int(box.cls[0])
                 if class_id not in VEHICLE_CLASSES:
                     continue
-                    
+                
                 vehicle_type = VEHICLE_CLASSES[class_id]
+                conf_score = float(box.conf[0])
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+                bbox_width = x2 - x1
+                bbox_height = y2 - y1
                 
-                # Determine if approaching or leaving
+                # Check if in ROI
+                in_roi = is_in_roi(center_x, center_y, roi_pixels) if use_roi else True
+                
+                # Estimate distance
+                dist_info = estimate_vehicle_distance(bbox_width, width, vehicle_type)
+                
+                # Store detection details
+                detection = {
+                    "type": vehicle_type,
+                    "confidence": round(conf_score, 2),
+                    "bbox": (x1, y1, x2, y2),
+                    "center": (center_x, center_y),
+                    "bbox_width_px": bbox_width,
+                    "bbox_height_px": bbox_height,
+                    "distance_m": dist_info["distance_m"],
+                    "in_roi": in_roi,
+                    "side": "left" if center_x < divider_x else "right"
+                }
+                detections.append(detection)
+                
+                if not in_roi:
+                    vehicle_data["outside_roi"] += 1
+                    # Draw gray box for outside ROI
+                    cv2.rectangle(output_frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
+                    continue
+                
+                # Count in ROI
+                vehicle_data["in_roi"][vehicle_type] += 1
+                vehicle_data["in_roi"]["total"] += 1
+                
+                # Determine direction
                 if center_x < divider_x:
                     category = "approaching" if approaching_side == "left" else "leaving"
                 else:
@@ -577,55 +731,52 @@ def detect_vehicles(
                 vehicle_data[category][vehicle_type] += 1
                 vehicle_data[category]["total"] += 1
                 
-                # Draw box - clean style
+                # Draw bounding box
                 if category == "approaching":
-                    color = (0, 255, 0)  # Green
-                    thickness = 2
+                    color = (0, 255, 0)  # Green - loading bridge
                 else:
-                    color = (100, 100, 100)  # Gray
-                    thickness = 1
+                    color = (128, 128, 128)  # Gray - leaving
                 
-                cv2.rectangle(output_frame, (x1, y1), (x2, y2), color, thickness)
+                cv2.rectangle(output_frame, (x1, y1), (x2, y2), color, 2)
                 
-                # Small label background + text
-                label = vehicle_type[:3].upper()
-                font_scale = 0.4
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-                
-                # Label above box
-                label_y = y1 - 4 if y1 > 20 else y2 + th + 4
-                cv2.rectangle(output_frame, (x1, label_y - th - 2), (x1 + tw + 4, label_y + 2), color, -1)
-                cv2.putText(output_frame, label, (x1 + 2, label_y),
-                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 1)
+                # Label with distance
+                label = f"{vehicle_type[:3].upper()} {dist_info['distance_m']}m"
+                cv2.putText(output_frame, label, (x1, y1 - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         
-        # Calculate load
+        # Calculate load and density (only from ROI)
         load_lbs = sum(
-            vehicle_data["approaching"][v] * weights.get(v, 4000)
-            for v in ["car", "truck", "bus", "motorcycle"]
+            vehicle_data["in_roi"][vtype] * VEHICLE_WEIGHTS.get(vtype, 0)
+            for vtype in ["car", "truck", "bus", "motorcycle"]
         )
-        load_tons = load_lbs / 2000
+        vehicle_data["load_tons"] = round(load_lbs / 2000, 2)
         
-        # Calculate density
-        bridge_length = bridge_config.total_length_m if bridge_config else 237.4
-        density = vehicle_data["approaching"]["total"] * 5 / bridge_length
+        # Density calculation
+        roi_width_m = bridge_config.total_length_m if bridge_config else 237.4
+        vehicle_data["density"] = round(vehicle_data["in_roi"]["total"] / roi_width_m, 4)
         
-        vehicle_data["load_tons"] = round(load_tons, 1)
-        vehicle_data["load_lbs"] = load_lbs
-        vehicle_data["density"] = round(density, 4)
+        # Detection statistics
+        if detections:
+            distances = [d["distance_m"] for d in detections if d["distance_m"] < 500]
+            vehicle_data["detection_stats"] = {
+                "total_detected": len(detections),
+                "in_roi": vehicle_data["in_roi"]["total"],
+                "outside_roi": vehicle_data["outside_roi"],
+                "min_distance_m": round(min(distances), 1) if distances else 0,
+                "max_distance_m": round(max(distances), 1) if distances else 0,
+                "avg_distance_m": round(np.mean(distances), 1) if distances else 0,
+            }
+        else:
+            vehicle_data["detection_stats"] = {
+                "total_detected": 0, "in_roi": 0, "outside_roi": 0,
+                "min_distance_m": 0, "max_distance_m": 0, "avg_distance_m": 0
+            }
         
-        # NO text overlay on image - stats shown in Streamlit UI
-        
-        return vehicle_data, output_frame
-        
-    except cv2.error as e:
-        logger.error(f"OpenCV error in detection: {e}")
-        return {}, frame
-    except RuntimeError as e:
-        logger.error(f"YOLO runtime error: {e}")
-        return {}, frame
+        return vehicle_data, output_frame, detections
+    
     except Exception as e:
         logger.error(f"Detection error: {type(e).__name__}: {e}")
-        return {}, frame
+        return {}, frame, []
 
 
 # =============================================================================
@@ -735,14 +886,15 @@ def run_monte_carlo(
         # Use Gaussian centered on live_density if available
         if live_density is not None:
             if live_density < 0.005:
-                return pd.DataFrame([{
+                results.append({
                     "density": 0.0,
                     "v_max": 80,
                     "alpha": 0.0005,
                     "shockwave_speed": 0.0,
-            "fatigue": 0.0,
-            "jam_injected": False
-        }])
+                    "fatigue": 0.0,
+                    "jam_injected": False
+                })
+                continue
 
             # Gaussian with std=0.1, clipped to valid range
             density = np.random.normal(live_density, 0.1)
@@ -756,63 +908,24 @@ def run_monte_carlo(
         # Probabilistic jam injection
         inject_jam = np.random.random() < inject_jam_probability
         
-sim = run_lwr_simulation(
-    initial_density=vehicle_data.get("density", 0.03),
-    road_length_m=bridge_config.total_length_m,
-    v_max_mps=22.2
-)
-
-# Compute fatigue damage using Miner's Rule
-damage, mu_S, sigma_S = compute_fatigue_damage(sim["stress_history"])
-
-# Compute reliability index β
-beta = compute_reliability_index(mu_S=mu_S, sigma_S=sigma_S)
-
-# Get truck percentage
-approaching = vehicle_data.get("approaching", {})
-total = approaching.get("total", 1)
-trucks = approaching.get("truck", 0)
-truck_pct = trucks / total if total > 0 else 0.15
-
-# PREDICT using trained model with CURRENT weather + traffic
-if st.session_state.rf_model is not None:
-    predicted_fatigue, _ = predict_fatigue_with_weather(
-        model=st.session_state.rf_model,
-        density=vehicle_data.get("density", 0.03),
-        shockwave=sim["shockwave_speed"],
-        truck_pct=truck_pct,
-        temperature=st.session_state.weather.get("temperature", 15),
-        precipitation=st.session_state.weather.get("precipitation", 0),
-        wind_speed=st.session_state.weather.get("wind_speed", 10),
-        freeze_thaw=st.session_state.weather.get("freeze_thaw_7day", 0),
-        month=datetime.now().month
-    )
-else:
-    predicted_fatigue = sim["fatigue"]
-
-# Include in log
-frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-pil_img = Image.fromarray(frame_rgb)
-buffer = io.BytesIO()
-pil_img.save(buffer, format="JPEG", quality=80)
-img_b64 = base64.b64encode(buffer.getvalue()).decode()
-
-st.session_state.session_log.append({
-    "timestamp": datetime.now(),
-    "vehicle_data": vehicle_data,
-    "image_b64": img_b64,
-    "damage": round(damage, 6),
-    "reliability_index": round(beta, 2),
-    "predicted_fatigue": round(predicted_fatigue, 2),  # NEW
-    "weather_used": {  # NEW - track what weather was used
-        "temp": st.session_state.weather.get("temperature"),
-        "precip": st.session_state.weather.get("precipitation"),
-        "wind": st.session_state.weather.get("wind_speed"),
-        "freeze_thaw": st.session_state.weather.get("freeze_thaw_7day")
-    }
-})
-    
-return pd.DataFrame(results)
+        # Run single simulation
+        sim = run_lwr_simulation(
+            initial_density=density,
+            road_length_m=road_length_m,
+            v_max_mps=v_max,
+            inject_jam=inject_jam
+        )
+        
+        results.append({
+            "density": density,
+            "v_max": v_max * 3.6,
+            "alpha": alpha,
+            "shockwave_speed": sim["shockwave_speed"],
+            "fatigue": sim["fatigue"],
+            "jam_injected": inject_jam
+        })
+            
+    return pd.DataFrame(results)
 
 
 def train_model(data: pd.DataFrame) -> Tuple:
@@ -1754,6 +1867,30 @@ def main():
     if not YOLO_AVAILABLE:
         st.error("YOLO not available. Install: `pip install ultralytics`")
         st.stop()
+
+    # =========================================================================
+    # INITIALIZE SESSION STATE
+    # =========================================================================
+    if "baseline_calculated" not in st.session_state:
+        st.session_state.baseline_calculated = False
+        st.session_state.baseline_traffic_fatigue = 50
+        st.session_state.baseline_env_stress = 30
+        st.session_state.mc_data = None
+        st.session_state.rf_model = None
+        st.session_state.rf_metrics = {}
+        st.session_state.vehicle_data = {}
+        st.session_state.weather = {}
+        # Initialize weights in session state
+        st.session_state.vehicle_weights = VEHICLE_WEIGHTS.copy()
+    
+    if "monitoring_active" not in st.session_state:
+        st.session_state.monitoring_active = False
+        st.session_state.monitoring_start_time = None
+        st.session_state.session_log = []  # List of {timestamp, vehicle_data, image_b64}
+    
+    if "yolo_model" not in st.session_state:
+        with st.spinner("Loading YOLO model..."):
+            st.session_state.yolo_model = YOLO("yolov8n.pt")
     
     # =========================================================================
     # HEADER
@@ -1780,7 +1917,37 @@ def main():
         st.subheader("Detection")
         lane_divider = st.slider("Lane Divider", 0.3, 0.7, 0.43, 0.01)
         confidence = st.slider("Confidence", 0.05, 0.50, 0.15, 0.05)
+
+        # ROI Configuration
+        st.markdown("---")
+        st.markdown("**📦 Region of Interest (ROI)**")
         
+        use_roi = st.checkbox("Enable ROI Box", value=True, 
+                              help="Only count vehicles within the defined box")
+        
+        if use_roi:
+            st.markdown("*Adjust ROI boundaries (% of frame)*")
+            col_roi1, col_roi2 = st.columns(2)
+            with col_roi1:
+                roi_x1 = st.slider("Left edge %", 0, 50, 20, key="roi_x1")
+                roi_y1 = st.slider("Top edge %", 0, 50, 35, key="roi_y1")
+            with col_roi2:
+                roi_x2 = st.slider("Right edge %", 50, 100, 80, key="roi_x2")
+                roi_y2 = st.slider("Bottom edge %", 50, 100, 75, key="roi_y2")
+            
+            roi_override = {
+                "x1_pct": roi_x1 / 100,
+                "y1_pct": roi_y1 / 100,
+                "x2_pct": roi_x2 / 100,
+                "y2_pct": roi_y2 / 100
+            }
+        else:
+            roi_override = None
+        
+        # Store in session state
+        st.session_state.use_roi = use_roi
+        st.session_state.roi_override = roi_override
+
         st.markdown("---")
         st.subheader("📹 Monitoring Session")
         capture_interval = st.select_slider(
@@ -1869,14 +2036,16 @@ def main():
         frame = capture_frame(camera_config["url"])
         
         if frame is not None:
-            vehicle_data, annotated_frame = detect_vehicles(
-                frame,
-                st.session_state.yolo_model,
-                camera_config,
-                lane_divider,
-                confidence,
-                bridge_config,
-                st.session_state.vehicle_weights
+            vehicle_data, annotated_frame, detections = detect_vehicles(
+                frame=frame,
+                model =st.session_state.yolo_model,
+                camera_config=camera_config,
+                camera_name=selected_camera,
+                lane_divider=lane_divider,
+                confidence=confidence,
+                bridge_config=bridge_config,
+                use_roi=st.session_state.get("use_roi", True),
+                roi_override=st.session_state.get("roi_override", None)
             )
             st.session_state.vehicle_data = vehicle_data
             
@@ -1923,7 +2092,42 @@ def main():
         with col_w2:
             st.metric("Precip", f"{weather['precipitation']} mm")
             st.metric("F/T Cycles", weather['freeze_thaw_7day'])
-        # Optional: show damage + reliability if available
+
+        # Detection Distance & ROI Analysis
+        if vd.get("detection_stats"):
+            stats = vd["detection_stats"]
+            
+            with st.expander("📏 Detection Distance & Coverage", expanded=False):
+                col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+                with col_d1:
+                    st.metric("Total Detected", stats.get("total_detected", 0))
+                with col_d2:
+                    st.metric("In ROI", stats.get("in_roi", 0))
+                with col_d3:
+                    st.metric("Outside ROI", stats.get("outside_roi", 0))
+                with col_d4:
+                    in_roi = stats.get("in_roi", 0)
+                    total = stats.get("total_detected", 1)
+                    roi_pct = (in_roi / total * 100) if total > 0 else 0
+                    st.metric("ROI %", f"{roi_pct:.0f}%")
+                
+                col_e1, col_e2, col_e3 = st.columns(3)
+                with col_e1:
+                    st.metric("Nearest", f"{stats.get('min_distance_m', 0)} m")
+                with col_e2:
+                    st.metric("Farthest", f"{stats.get('max_distance_m', 0)} m")
+                with col_e3:
+                    st.metric("Avg Distance", f"{stats.get('avg_distance_m', 0)} m")
+                
+                min_dist = stats.get("min_distance_m", 0)
+                max_dist = stats.get("max_distance_m", 0)
+                if max_dist > 0 and max_dist < 500:
+                    st.info(
+                        f"**Camera Coverage:** {min_dist}m - {max_dist}m "
+                        f"(~{max_dist - min_dist:.0f}m monitoring zone)"
+                    )
+
+        # show damage + reliability if available
         if st.session_state.session_log:
             latest = st.session_state.session_log[-1]
             st.markdown("---")
@@ -1931,6 +2135,8 @@ def main():
 
             st.metric("Fatigue Damage (Miner)", f"{latest.get('damage', 0.0):.6f}")
             st.metric("Reliability Index β", f"{latest.get('reliability_index', 0.0):.2f}")
+
+
     
     # =========================================================================
     # MONITORING SESSION
@@ -1981,11 +2187,18 @@ def main():
                 frame = capture_frame(camera_config["url"])
                 
                 if frame is not None:
-                    vehicle_data, annotated_frame = detect_vehicles(
-                        frame, st.session_state.yolo_model, camera_config,
-                        lane_divider, confidence, bridge_config,
-                        st.session_state.vehicle_weights
-                    )
+                    vehicle_data, annotated_frame, detections = detect_vehicles(
+                                            frame=frame,
+                                            model=st.session_state.yolo_model,  
+                                            camera_config=camera_config,
+                                            camera_name=selected_camera,
+                                            lane_divider=lane_divider,
+                                            confidence=confidence,
+                                            bridge_config=bridge_config,
+                                            use_roi=st.session_state.get("use_roi", True),
+                                            roi_override=st.session_state.get("roi_override", None)
+                                        )
+                    
                     # Run LWR simulation with this density
                     sim = run_lwr_simulation(
                         initial_density=vehicle_data.get("density", 0.03),
