@@ -1,0 +1,55 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtualenv / envs
+env/
+venv/
+ENV/
+.venv/
+venv.bak/
+
+# Pytest cache
+.cache/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights
+*.pt
+*.pth
+
+# Snapshots and outputs
+bridge_snapshots/
+
+# Editor swap files
+*.swp
+*.swo
+
+/Peace_Bridge_Video_settings.py
