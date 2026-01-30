@@ -2220,6 +2220,7 @@ def main():
                     roi_override=st.session_state.get("roi_override", None)
                 )
                 st.session_state.vehicle_data = vehicle_data
+                st.session_state.latest_detections = detections
                 
                 frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
                 video_placeholder.image(frame_rgb, width='stretch')
@@ -2307,11 +2308,12 @@ def main():
         # show damage + reliability if available
         if st.session_state.session_log:
             latest = st.session_state.session_log[-1]
+            beta_latest = latest.get("reliability_index", None)
             st.markdown("---")
             st.subheader("🔧 Fatigue + Reliability")
 
             st.metric("Fatigue Damage (Miner)", f"{latest.get('damage', 0.0):.6f}")
-            st.metric("Reliability Index β", f"{beta:.2f}" if beta is not None else "—")
+            st.metric("Reliability Index β", f"{beta_latest:.2f}" if beta_latest is not None else "—")
     
     # =========================================================================
     # MONITORING SESSION
@@ -2381,6 +2383,7 @@ def main():
                                             use_roi=st.session_state.get("use_roi", True),
                                             roi_override=st.session_state.get("roi_override", None)
                                         )
+                    st.session_state.latest_detections = detections
                     
                     # Run LWR simulation with this density
                     sim = run_lwr_simulation(
@@ -2412,7 +2415,7 @@ def main():
                         "vehicle_data": vehicle_data,
                         "image_b64": img_b64,
                         "damage": round(damage, 6),
-                        "reliability_index": round(beta, 2)
+                        "reliability_index": round(beta, 2) if beta is not None else None
                     })
                     
                     # Cap log size to prevent memory issues (keep last 500 entries)
