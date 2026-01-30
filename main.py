@@ -171,6 +171,29 @@ def is_in_roi(center_x: int, center_y: int, roi: Tuple[int, int, int, int]) -> b
     x1, y1, x2, y2 = roi
     return x1 <= center_x <= x2 and y1 <= center_y <= y2
 
+
+def format_vehicle_types_detected(vehicle_data: Dict) -> str:
+    """Return a compact string of vehicle types detected in ROI."""
+    in_roi = vehicle_data.get("in_roi", {}) or {}
+    if in_roi:
+        counts = {
+            "car": int(in_roi.get("car", 0) or 0),
+            "truck": int(in_roi.get("truck", 0) or 0),
+            "bus": int(in_roi.get("bus", 0) or 0),
+            "motorcycle": int(in_roi.get("motorcycle", 0) or 0),
+        }
+    else:
+        appr = vehicle_data.get("approaching", {}) or {}
+        leave = vehicle_data.get("leaving", {}) or {}
+        counts = {
+            "car": int(appr.get("car", 0) or 0) + int(leave.get("car", 0) or 0),
+            "truck": int(appr.get("truck", 0) or 0) + int(leave.get("truck", 0) or 0),
+            "bus": int(appr.get("bus", 0) or 0) + int(leave.get("bus", 0) or 0),
+            "motorcycle": int(appr.get("motorcycle", 0) or 0) + int(leave.get("motorcycle", 0) or 0),
+        }
+    parts = [f"{name}:{count}" for name, count in counts.items() if count > 0]
+    return ", ".join(parts) if parts else "none"
+
 # =============================================================================
 # 3) WEATHER API (OPEN-METEO)
 # =============================================================================
@@ -2754,7 +2777,7 @@ def main():
         col_det1, col_det2, col_det3 = st.columns(3)
         
         with col_det1:
-            confidence = st.slider("Confidence", 0.05, 0.50, 0.15, 0.05)
+            confidence = st.slider("Confidence", 0.05, 0.50, 0.15, 0.05, key="det_confidence")
         with col_det2:
             lane_divider = st.slider("Lane Divider", 0.3, 0.7, 0.43, 0.01)
         with col_det3:
@@ -2860,7 +2883,8 @@ def main():
                     exp_interval = st.slider("Interval (sec)", 0.5, 10.0,
                         float(st.session_state.get("exp_settings", {}).get("interval_sec", 1.0)), 0.5)
                     exp_conf = st.slider("Confidence", 0.05, 0.50,
-                        float(st.session_state.get("exp_settings", {}).get("confidence", confidence)), 0.05)
+                        float(st.session_state.get("exp_settings", {}).get("confidence", confidence)), 0.05,
+                        key="exp_confidence")
                     traffic_w = st.slider("Traffic weight", 0.0, 1.0,
                         float(st.session_state.get("exp_settings", {}).get("traffic_weight", 0.70)), 0.05)
                 with col_e2:
@@ -3099,6 +3123,7 @@ def main():
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "approaching_total": vehicle_data.get("approaching", {}).get("total", 0),
                         "leaving_total": vehicle_data.get("leaving", {}).get("total", 0),
+                        "vehicle_types_detected": format_vehicle_types_detected(vehicle_data),
                         "load_tons": vehicle_data.get("load_tons", 0.0),
                         "density": vehicle_data.get("density", 0.0),
                         "avg_speed_kph": vehicle_data.get("avg_speed_kph", None),
@@ -3362,6 +3387,7 @@ def main():
             rows.append({
                 "time": e.get("timestamp"),
                 "vehicles": appr.get("total"),
+                "vehicle_types_detected": format_vehicle_types_detected(vd),
                 "load_tons": vd.get("load_tons"),
                 "density_veh_per_m": vd.get("density"),
                 "avg_speed_kph": vd.get("avg_speed_kph"),
@@ -3861,8 +3887,13 @@ def main():
                 width='stretch'
             )
         
-            # Generate hourly summary
+        # Generate hourly summary
         df_log["hour"] = pd.to_datetime(df_log["timestamp"]).dt.strftime("%Y-%m-%d %H:00")
+        df_log["damage_primary"] = np.where(
+            df_log["fatigue_damage_obs"].notna(),
+            df_log["fatigue_damage_obs"],
+            df_log["fatigue_damage_sim"]
+        )
 
         hourly_summary = df_log.groupby("hour").agg({
             "vehicles": "sum",
@@ -3870,12 +3901,6 @@ def main():
             "damage_primary": "mean",
             "beta_primary": "mean"
         }).reset_index()
-
-        df_log["damage_primary"] = np.where(
-            df_log["fatigue_damage_obs"].notna(),
-            df_log["fatigue_damage_obs"],
-            df_log["fatigue_damage_sim"]
-        )
 
         hourly_summary.rename(columns={
             "hour": "Hour",
