@@ -723,7 +723,8 @@ def detect_vehicles(
     confidence: float = 0.15,
     bridge_config: Optional[BridgeConfig] = None,
     use_roi: bool = True,
-    roi_override: Optional[Dict] = None
+    roi_override: Optional[Dict] = None,
+    weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[Dict, np.ndarray, list]:
     """
     Detect vehicles with ROI box and distance estimation.
@@ -845,11 +846,17 @@ def detect_vehicles(
                 cv2.putText(output_frame, label, (x1, y1 - 5),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         
+        w= weights or VEHICLE_WEIGHTS
+
         # Calculate load and density (only from ROI)
+        w = weights or VEHICLE_WEIGHTS
+
         load_lbs = sum(
-            vehicle_data["in_roi"][vtype] * VEHICLE_WEIGHTS.get(vtype, 0)
+            vehicle_data["in_roi"][vtype] * float(w.get(vtype, 0))
             for vtype in ["car", "truck", "bus", "motorcycle"]
         )
+        vehicle_data["load_tons"] = round(load_lbs / 2000.0, 2)
+
         vehicle_data["load_tons"] = round(load_lbs / 2000, 2)
         
         # Density calculation
@@ -878,6 +885,47 @@ def detect_vehicles(
     except Exception as e:
         logger.error(f"Detection error: {type(e).__name__}: {e}")
         return {}, frame, []
+
+
+def estimate_avg_speed_mps(detections: list, prev_detections: list, dt_s: float) -> Optional[float]:
+    """
+    Estimate average speed (m/s) by matching detections across frames.
+    Uses nearest-center matching within a pixel threshold, same type and side.
+    """
+    if not detections or not prev_detections or dt_s <= 0:
+        return None
+
+    max_match_dist_sq = 200 * 200
+    speeds = []
+
+    for det in detections:
+        if det.get("distance_m") is None:
+            continue
+        best = None
+        best_dist_sq = None
+        for prev in prev_detections:
+            if prev.get("type") != det.get("type"):
+                continue
+            if prev.get("side") != det.get("side"):
+                continue
+            dx = det["center"][0] - prev["center"][0]
+            dy = det["center"][1] - prev["center"][1]
+            dist_sq = dx * dx + dy * dy
+            if best_dist_sq is None or dist_sq < best_dist_sq:
+                best = prev
+                best_dist_sq = dist_sq
+        if best is None or best_dist_sq is None or best_dist_sq > max_match_dist_sq:
+            continue
+        prev_dist = best.get("distance_m")
+        if prev_dist is None:
+            continue
+        speed = abs(det["distance_m"] - prev_dist) / dt_s
+        if 0 <= speed <= 60:
+            speeds.append(speed)
+
+    if not speeds:
+        return None
+    return float(np.mean(speeds))
 
 def load_tons_to_stress_mpa(load_tons: float, k_mpa_per_ton: float = 0.6) -> float:
     """
@@ -954,37 +1002,62 @@ def run_lwr_simulation(
         "stress_history": stress_history
     }
 
+def plot_sim_obs_over_time(session_log: list) -> "go.Figure":
+    times = [e["timestamp"].strftime("%H:%M:%S") for e in session_log]
 
-def plot_reliability_over_time(session_log: list) -> go.Figure:
-    """Line chart of reliability index β over time"""
-    times = [entry["timestamp"].strftime("%H:%M:%S") for entry in session_log]
-    betas = [
-        round(min(entry.get("reliability_index", 0.0), 5.0), 2) 
-        if entry.get("reliability_index", 0.0) > 0 else None
-        for entry in session_log
-    ]
+    sim_sh = [e.get("sim_shockwave", None) for e in session_log]
+    obs_sh = [e.get("obs_shockwave", None) for e in session_log]
 
+    beta_sim = [e.get("sim_beta", None) for e in session_log]
+    beta_obs = [e.get("obs_beta", None) for e in session_log]
+    beta_primary = [e.get("beta_primary", None) for e in session_log]
+    gap_beta = [e.get("gap_beta", None) for e in session_log]
 
     fig = go.Figure()
-    # Filter out None for plotting, mark as gaps
-    if all(b is None for b in betas):
-        betas = [0 for _ in betas]  # fallback to zero line
 
-    fig.add_trace(go.Scatter(
-        x=times,
-        y=betas,
-        mode="lines+markers",
-        line=dict(color="#3498db", width=3),
-        name="Reliability Index β"
-    ))
+    # Shockwaves
+    fig.add_trace(go.Scatter(x=times, y=sim_sh, mode="lines+markers", name="Sim Shockwave (LWR)"))
+    fig.add_trace(go.Scatter(x=times, y=obs_sh, mode="lines+markers", name="Obs Shockwave (proxy)"))
 
-    fig.add_hline(y=3.0, line_dash="dash", line_color="green", annotation_text="Target β=3.0")
+    # Reliability betas
+    fig.add_trace(go.Scatter(x=times, y=beta_sim, mode="lines+markers", name="β Sim"))
+    fig.add_trace(go.Scatter(x=times, y=beta_obs, mode="lines+markers", name="β Obs"))
+    fig.add_trace(go.Scatter(x=times, y=beta_primary, mode="lines", name="β Primary", line=dict(dash="dash")))
+    fig.add_trace(go.Scatter(x=times, y=gap_beta, mode="lines", name="Gap β (Obs-Sim)", visible="legendonly"))
+
+    fig.add_hline(y=3.0, line_dash="dash", annotation_text="Target β=3.0")
+
     fig.update_layout(
-        title="Reliability Index Over Time",
+        title="Sim vs Observed: Shockwave and Reliability Over Time",
+        xaxis_title="Capture Time",
+        yaxis_title="Value (mixed units)",
+        template="plotly_white",
+        height=460,
+        legend=dict(orientation="h")
+    )
+
+    return fig
+
+
+def plot_reliability_over_time(session_log: list) -> "go.Figure":
+    times = [e["timestamp"].strftime("%H:%M:%S") for e in session_log]
+
+    sim_b = [e.get("sim_beta", None) for e in session_log]
+    obs_b = [e.get("obs_beta", None) for e in session_log]
+    gap_b = [e.get("gap_beta", None) for e in session_log]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=times, y=sim_b, mode="lines+markers", name="Sim β (LWR→Miner)"))
+    fig.add_trace(go.Scatter(x=times, y=obs_b, mode="lines+markers", name="Obs β (Camera→Miner)"))
+    fig.add_trace(go.Scatter(x=times, y=gap_b, mode="lines", name="Gap β (Obs - Sim)", visible="legendonly"))
+
+    fig.add_hline(y=3.0, line_dash="dash", annotation_text="Target β=3.0")
+    fig.update_layout(
+        title="Reliability Index Over Time (Sim vs Observed)",
         xaxis_title="Capture Time",
         yaxis_title="β",
         template="plotly_white",
-        height=350
+        height=380
     )
     return fig
 
@@ -1186,6 +1259,122 @@ def predict_fatigue_with_weather(
     
     return prediction, features
 
+def compute_confidence_score(vehicle_data: Dict, weather: Dict, rf_metrics: Dict) -> Dict:
+    """
+    Returns a confidence score (0-1), label, and reasons.
+    Uses only signals already available in the app.
+    """
+    stats = vehicle_data.get("detection_stats", {})
+    total_detected = float(stats.get("total_detected", 0) or 0)
+    in_roi = float(stats.get("in_roi", 0) or 0)
+    roi_ratio = (in_roi / total_detected) if total_detected > 0 else 0.0
+
+    speed_ok = 1.0 if vehicle_data.get("avg_speed_mps") is not None else 0.0
+    weather_ok = 1.0 if weather.get("success", False) else 0.0
+
+    # RF quality proxy if available
+    r2 = rf_metrics.get("cv_r2_mean", None)
+    if r2 is None:
+        rf_ok = 0.0
+        rf_strength = 0.0
+    else:
+        rf_ok = 1.0
+        rf_strength = float(np.clip((r2 + 1.0) / 2.0, 0.0, 1.0))  # map [-1,1] -> [0,1]
+
+    # Detection sufficiency
+    det_strength = float(np.clip(total_detected / 10.0, 0.0, 1.0))  # >=10 detections => strong
+    roi_strength = float(np.clip(roi_ratio / 0.70, 0.0, 1.0))       # >=70% in ROI => strong
+
+    score = (
+        0.35 * det_strength +
+        0.25 * roi_strength +
+        0.15 * speed_ok +
+        0.10 * weather_ok +
+        0.15 * rf_strength
+    )
+    score = float(np.clip(score, 0.0, 1.0))
+
+    if score >= 0.75:
+        label = "High"
+    elif score >= 0.50:
+        label = "Medium"
+    else:
+        label = "Low"
+
+    reasons = []
+    reasons.append(f"Detections: {int(total_detected)}")
+    reasons.append(f"ROI coverage: {roi_ratio*100:.0f}%")
+    reasons.append("Speed: OK" if speed_ok else "Speed: N/A")
+    reasons.append("Weather: OK" if weather_ok else "Weather: fallback")
+    if rf_ok:
+        reasons.append(f"RF CV R²: {r2:.2f}")
+    else:
+        reasons.append("RF: not trained")
+
+    return {"score": round(score, 2), "label": label, "reasons": reasons}
+
+
+def detect_events(session_log: list, speed_drop_pct: float = 30.0) -> list:
+    """
+    Create event tags based on recent captures.
+    Returns a list of strings (event codes).
+    """
+    if not session_log:
+        return []
+
+    latest = session_log[-1]
+    vd = latest.get("vehicle_data", {})
+    approaching = vd.get("approaching", {})
+    total = float(approaching.get("total", 0) or 0)
+    trucks = float(approaching.get("truck", 0) or 0)
+    truck_pct = (trucks / total) if total > 0 else 0.0
+
+    density = float(vd.get("density", 0.0) or 0.0)
+    speed = vd.get("avg_speed_kph", None)
+
+    events = []
+
+    # Truck surge
+    if truck_pct >= 0.25 and total >= 5:
+        events.append("TRUCK_SURGE")
+
+    # Jam likely: high density + low speed
+    if speed is not None and density >= 0.08 and speed <= 25:
+        events.append("JAM_LIKELY")
+
+    # Speed drop compared to previous
+    if len(session_log) >= 2:
+        prev = session_log[-2].get("vehicle_data", {})
+        prev_speed = prev.get("avg_speed_kph", None)
+        if speed is not None and prev_speed is not None and prev_speed > 1:
+            drop = (prev_speed - speed) / prev_speed * 100.0
+            if drop >= speed_drop_pct:
+                events.append("SPEED_DROP_EVENT")
+
+    # Heavy load event
+    load_tons = float(vd.get("load_tons", 0.0) or 0.0)
+    if load_tons >= 60:
+        events.append("HEAVY_LOAD")
+
+    return events
+
+
+def compute_sim_obs_gap(entry: Dict) -> Dict:
+    """
+    Compute gaps between observed and simulated outputs.
+    """
+    sim_damage = float(entry.get("sim_damage", 0.0) or 0.0)
+    obs_damage = float(entry.get("obs_damage", 0.0) or 0.0)
+    sim_beta = entry.get("sim_beta", None)
+    obs_beta = entry.get("obs_beta", None)
+
+    gap_damage = obs_damage - sim_damage
+    gap_beta = None
+    if sim_beta is not None and obs_beta is not None:
+        gap_beta = float(obs_beta) - float(sim_beta)
+
+    return {"gap_damage": round(gap_damage, 6), "gap_beta": round(gap_beta, 2) if gap_beta is not None else None}
+
 
 def predict_fatigue(
     model,
@@ -1209,6 +1398,7 @@ def predict_fatigue(
     return model.predict(X)[0]
 
 
+
 # =============================================================================
 # SCENARIO ANALYSIS
 # =============================================================================
@@ -1220,7 +1410,8 @@ def calculate_scenario_fatigue(
     truck_percentage: float,
     freeze_thaw_cycles: int,
     temperature: float,
-    precipitation: float
+    precipitation: float,
+    bridge_age: int
 ) -> Dict:
     """Calculate fatigue for a given scenario"""
     
@@ -1239,7 +1430,7 @@ def calculate_scenario_fatigue(
         precipitation=precipitation,
         freeze_thaw_cycles=freeze_thaw_cycles,
         wind_speed=10,
-        bridge_age=datetime.now().year - 1959
+        bridge_age=datetime.now().year - 1927
     )
     
     # Combined fatigue (weighted)
@@ -1253,6 +1444,19 @@ def calculate_scenario_fatigue(
         "combined_fatigue": round(combined, 1),
         "env_breakdown": env_stress
     }
+
+def choose_vmax_from_observed_speed(avg_speed_mps: Optional[float]) -> float:
+    """
+    Map observed average speed to a plausible free-flow v_max for LWR.
+    Keep bounded to avoid extreme values.
+    """
+    if avg_speed_mps is None:
+        return 22.2  # fallback ~80 km/h
+
+    # v_max should be >= observed speed, but not ridiculous
+    # small uplift accounts for "free flow" vs measured average
+    v = float(avg_speed_mps * 1.20)
+    return float(np.clip(v, 8.0, 33.0))  # 8 m/s (29 km/h) to 33 m/s (119 km/h)
 
 
 def get_status(score: float) -> Tuple[str, str]:
@@ -1451,6 +1655,160 @@ def create_seasonal_fatigue_chart(seasonal_data: pd.DataFrame) -> go.Figure:
     
     return fig
 
+def build_observed_stress_history(
+    load_tons: float,
+    density: float,
+    avg_speed_mps: Optional[float],
+    window_s: int = 60,
+    dt_s: int = 1
+) -> list:
+    """
+    Build an 'observed' stress history (proxy) using ONLY camera-derived quantities:
+    - load_tons: from YOLO class counts × weights
+    - density: vehicles/m from ROI count / bridge length
+    - avg_speed_mps: estimated from frame-to-frame distance deltas (if available)
+
+    We construct a short time window stress series (window_s) so Miner can run on something.
+    This is NOT structural MPa; it's a normalized proxy (0-100).
+    """
+
+    # Normalize components into 0-100-ish proxy scores
+    # Tune these reference values for your bridge/demo
+    load_ref_tons = 80.0       # typical high live load in tons (proxy)
+    density_ref = 0.12         # vehicles/m near congestion (proxy)
+    speed_free = 22.2          # ~80 km/h in m/s
+
+    load_score = np.clip((load_tons / load_ref_tons) * 100.0, 0.0, 120.0)
+    dens_score = np.clip((density / density_ref) * 100.0, 0.0, 120.0)
+
+    if avg_speed_mps is None:
+        speed_penalty = 15.0   # unknown speed → modest penalty
+    else:
+        # slower traffic => more stop/go => more stress cycling (proxy)
+        speed_ratio = np.clip(avg_speed_mps / speed_free, 0.0, 1.5)
+        speed_penalty = (1.0 - np.clip(speed_ratio, 0.0, 1.0)) * 40.0  # up to +40
+
+    base = 0.45 * load_score + 0.45 * dens_score + 0.10 * speed_penalty
+    base = float(np.clip(base, 0.0, 100.0))
+
+    # Add small oscillation + noise to mimic stop-go cycling for Miner
+    stress_series = []
+    for t in range(0, window_s, dt_s):
+        cyc = 6.0 * np.sin(2 * np.pi * t / 18.0)     # ~18s cycle
+        noise = float(np.random.normal(0.0, 1.5))    # small jitter
+        stress_series.append(float(np.clip(base + cyc + noise, 0.0, 100.0)))
+
+    return stress_series
+
+def proxy_stress_to_mpa(stress_proxy: list, stress_ref_mpa: float) -> list:
+    """
+    stress_proxy is 0–100, map to 0–stress_ref_mpa MPa (proxy).
+    """
+    if not stress_proxy:
+        return []
+    scale = float(stress_ref_mpa) / 100.0
+    return [float(s) * scale for s in stress_proxy]
+
+
+def compute_simulated_damage_beta(
+    density: float,
+    road_length_m: float,
+    v_max_mps: float,
+    inject_jam: bool = False,
+    miner_m: int = 3,
+    miner_C: float = 1e12,
+    mu_R: float = 250.0,
+    sigma_R: float = 25.0,
+    stress_ref_mpa: float = 80.0
+) -> Dict:
+    sim = run_lwr_simulation(
+        initial_density=density,
+        road_length_m=road_length_m,
+        v_max_mps=v_max_mps,
+        inject_jam=inject_jam
+    )
+    stress_mpa_series = proxy_stress_to_mpa(sim["stress_history"], stress_ref_mpa)
+    damage, mu_S, sigma_S = compute_fatigue_damage(stress_mpa_series, m=miner_m, C=miner_C)
+    beta = compute_reliability_index(mu_R=mu_R, sigma_R=sigma_R, mu_S=mu_S, sigma_S=sigma_S)
+
+    return {
+        "sim": sim,
+        "sim_damage": round(damage, 6),
+        "sim_mu_S": round(mu_S, 4),
+        "sim_sigma_S": round(sigma_S, 4),
+        "sim_beta": round(beta, 2),
+        "sim_shockwave": float(sim.get("shockwave_speed", 0.0)),
+    }
+
+
+def compute_observed_damage_beta(
+    load_tons: float,
+    density: float,
+    avg_speed_mps: Optional[float],
+    miner_m: int = 3,
+    miner_C: float = 1e12,
+    mu_R: float = 250.0,
+    sigma_R: float = 25.0,
+    stress_ref_mpa: float = 80.0
+) -> Dict:
+    obs_series = build_observed_stress_history(
+        load_tons=load_tons,
+        density=density,
+        avg_speed_mps=avg_speed_mps
+    )
+
+    stress_mpa_series = proxy_stress_to_mpa(obs_series, stress_ref_mpa)
+    damage, mu_S, sigma_S = compute_fatigue_damage(stress_mpa_series, m=miner_m, C=miner_C)
+    beta = compute_reliability_index(mu_R=mu_R, sigma_R=sigma_R, mu_S=mu_S, sigma_S=sigma_S)
+
+    return {
+        "obs_stress_history": obs_series,
+        "obs_damage": round(damage, 6),
+        "obs_mu_S": round(mu_S, 4),
+        "obs_sigma_S": round(sigma_S, 4),
+        "obs_beta": round(beta, 2),
+    }
+
+def compute_observed_shockwave_proxy(session_log: list) -> float:
+    """
+    Observed shockwave proxy (unitless):
+    - increases when speed drops sharply (deceleration / stop-go)
+    - increases when density increases quickly
+    Uses only logged observed values (density, avg_speed_mps).
+    """
+    if len(session_log) < 2:
+        return 0.0
+
+    cur = session_log[-1].get("vehicle_data", {})
+    prev = session_log[-2].get("vehicle_data", {})
+
+    rho_now = float(cur.get("density", 0.0) or 0.0)
+    rho_prev = float(prev.get("density", 0.0) or 0.0)
+
+    v_now = cur.get("avg_speed_mps", None)
+    v_prev = prev.get("avg_speed_mps", None)
+
+    # Density change (vehicles/m)
+    drho = max(0.0, rho_now - rho_prev)
+
+    # Speed drop (m/s)
+    if v_now is None or v_prev is None:
+        dv_drop = 0.0
+    else:
+        dv_drop = max(0.0, float(v_prev) - float(v_now))
+
+    # Normalize to reasonable ranges (tunable)
+    drho_ref = 0.02   # density jump reference
+    dv_ref = 5.0      # speed drop reference (~18 km/h)
+
+    rho_term = min(1.0, drho / drho_ref)
+    v_term = min(1.0, dv_drop / dv_ref)
+
+    # Combine (weights reflect that speed drop is the strongest stop-go signature)
+    shock_proxy = 0.35 * rho_term + 0.65 * v_term
+
+    return float(round(shock_proxy, 3))
+
 
 # =============================================================================
 # REPORT GENERATION
@@ -1503,7 +1861,7 @@ def generate_html_report(
 ) -> str:
     """Generate HTML report for download"""
     
-    status_text, status_color = get_status(scenario_result["combined_fatigue"])
+    status_text, _ = get_status(scenario_result["combined_fatigue"])
     
     html = f"""
     <!DOCTYPE html>
@@ -1622,7 +1980,7 @@ def generate_html_report(
         
         <div class="footer">
             <p>Hybrid Digital Twin - Bridge Fatigue Monitoring System</p>
-            <p>Case Study: Twin Bridges (I-87 over Mohawk River, New York)</p>
+            <p>Case Study: Twin Bridges (Peace Bridge)</p>
             <p>For research and demonstration purposes only</p>
         </div>
     </body>
@@ -1647,7 +2005,8 @@ def generate_session_report(
     avg_vehicles = total_vehicles / len(session_log)
     avg_load = sum(entry["vehicle_data"]["load_tons"] for entry in session_log) / len(session_log)
     max_load = max(entry["vehicle_data"]["load_tons"] for entry in session_log)
-    avg_beta = sum(e.get("reliability_index", 0.0) for e in session_log) / len(session_log)
+    avg_beta = sum(float(e.get("beta_primary") or 0.0) for e in session_log) / len(session_log)
+
 
     
     start_time = session_log[0]["timestamp"]
@@ -2052,13 +2411,23 @@ def main():
         st.session_state.monitoring_active = False
         st.session_state.monitoring_start_time = None
         st.session_state.session_log = []  # List of {timestamp, vehicle_data, image_b64}
+        st.session_state.auto_monitoring_enabled = False
+        st.session_state.auto_monitoring_started = False
+        st.session_state.validation_active = False
+        st.session_state.validation_duration_min = 60
+        st.session_state.validation_interval_sec = 30
+        st.session_state.k_mpa_per_ton = 0.6
+        st.session_state.stress_ref_mpa = 80.0
+        st.session_state.prev_detections = None
+        st.session_state.prev_detections_time = None
         st.session_state.latest_frame_rgb = None
         st.session_state.latest_frame_time = None
     
     if "yolo_model" not in st.session_state:
         with st.spinner("Loading YOLO model..."):
             st.session_state.yolo_model = YOLO("yolov8n.pt")
-    
+
+  
     # =========================================================================
     # HEADER
     # =========================================================================
@@ -2080,68 +2449,97 @@ def main():
         selected_camera = st.selectbox("📹 Camera", list(CAMERAS.keys()))
         camera_config = CAMERAS[selected_camera]
         
-        st.markdown("---")
         st.subheader("Detection")
         lane_divider = st.slider("Lane Divider", 0.3, 0.7, 0.43, 0.01)
         confidence = st.slider("Confidence", 0.05, 0.50, 0.15, 0.05)
 
-        # ROI Configuration
-        st.markdown("---")
-        st.markdown("**📦 Region of Interest (ROI)**")
-        
-        use_roi = st.checkbox("Enable ROI Box", value=True, 
-                              help="Only count vehicles within the defined box")
-        
-        if use_roi:
-            st.markdown("*Adjust ROI boundaries (% of frame)*")
-            col_roi1, col_roi2 = st.columns(2)
-            with col_roi1:
-                roi_x1 = st.slider("Left edge %", 0, 50, 20, key="roi_x1")
-                roi_y1 = st.slider("Top edge %", 0, 50, 35, key="roi_y1")
-            with col_roi2:
-                roi_x2 = st.slider("Right edge %", 50, 100, 80, key="roi_x2")
-                roi_y2 = st.slider("Bottom edge %", 50, 100, 75, key="roi_y2")
+        with st.expander("ROI (Advanced)", expanded=False):
+            use_roi = st.checkbox("Enable ROI Box", value=True, 
+                                  help="Only count vehicles within the defined box")
             
-            roi_override = {
-                "x1_pct": roi_x1 / 100,
-                "y1_pct": roi_y1 / 100,
-                "x2_pct": roi_x2 / 100,
-                "y2_pct": roi_y2 / 100
-            }
-        else:
-            roi_override = None
+            if use_roi:
+                st.markdown("*Adjust ROI boundaries (% of frame)*")
+                col_roi1, col_roi2 = st.columns(2)
+                with col_roi1:
+                    roi_x1 = st.slider("Left edge %", 0, 50, 20, key="roi_x1")
+                    roi_y1 = st.slider("Top edge %", 0, 50, 35, key="roi_y1")
+                with col_roi2:
+                    roi_x2 = st.slider("Right edge %", 50, 100, 80, key="roi_x2")
+                    roi_y2 = st.slider("Bottom edge %", 50, 100, 75, key="roi_y2")
+                
+                roi_override = {
+                    "x1_pct": roi_x1 / 100,
+                    "y1_pct": roi_y1 / 100,
+                    "x2_pct": roi_x2 / 100,
+                    "y2_pct": roi_y2 / 100
+                }
+            else:
+                roi_override = None
         
         # Store in session state
         st.session_state.use_roi = use_roi
         st.session_state.roi_override = roi_override
 
-        st.markdown("---")
-        st.subheader("📹 Monitoring Session")
-        capture_interval = st.select_slider(
-            "Capture every",
-            options=[10, 15, 30, 45, 60, 120, 300],
-            value=30,
-            format_func=lambda x: f"{x} sec" if x < 60 else f"{x//60} min"
-        )
-        monitor_duration = st.select_slider(
-            "Duration",
-            options=[1, 2, 5, 10, 15, 30, 60],
-            value=5,
-            format_func=lambda x: f"{x} min"
-        )
+        with st.expander("Monitoring Session", expanded=True):
+            capture_interval = st.select_slider(
+                "Capture every",
+                options=[10, 15, 30, 45, 60, 120, 300],
+                value=30,
+                format_func=lambda x: f"{x} sec" if x < 60 else f"{x//60} min"
+            )
+            monitor_duration = st.select_slider(
+                "Duration",
+                options=[1, 2, 5, 10, 15, 30, 60],
+                value=5,
+                format_func=lambda x: f"{x} min"
+            )
+            auto_monitoring_enabled = st.toggle(
+                "Fixed-time capture",
+                value=st.session_state.auto_monitoring_enabled,
+                help="Automatically run a monitoring session for the selected duration."
+            )
+            st.session_state.auto_monitoring_enabled = auto_monitoring_enabled
+
+        with st.expander("Validation Run", expanded=False):
+            validation_interval = st.select_slider(
+                "Validation capture every",
+                options=[10, 15, 30, 45, 60, 120, 300],
+                value=st.session_state.validation_interval_sec,
+                format_func=lambda x: f"{x} sec" if x < 60 else f"{x//60} min"
+            )
+            validation_duration = st.select_slider(
+                "Validation duration",
+                options=[10, 15, 30, 45, 60, 90, 120],
+                value=st.session_state.validation_duration_min,
+                format_func=lambda x: f"{x} min"
+            )
+            if st.button("▶️ Start Validation Run"):
+                st.session_state.validation_interval_sec = validation_interval
+                st.session_state.validation_duration_min = validation_duration
+                st.session_state.monitoring_active = True
+                st.session_state.monitoring_start_time = datetime.now()
+                st.session_state.session_log = []
+                st.session_state.validation_active = True
+                st.rerun()
         
-        st.markdown("---")
-        st.subheader("Simulation")
-        mc_runs = st.slider("Monte Carlo Runs", 50, 300, 100, 50)
-        jam_probability = st.slider("Jam Event Probability", 0.0, 1.0, 0.3, 0.1, 
-                                    help="Probability of traffic jam in each simulation run")
+        with st.expander("Simulation (Advanced)", expanded=False):
+            mc_runs = st.slider("Monte Carlo Runs", 50, 300, 100, 50)
+            jam_probability = st.slider("Jam Event Probability", 0.0, 1.0, 0.3, 0.1, 
+                                        help="Probability of traffic jam in each simulation run")
+            st.session_state.k_mpa_per_ton = st.slider(
+                "Stress proxy k (MPa/ton)",
+                0.1,
+                2.0,
+                float(st.session_state.k_mpa_per_ton),
+                0.1,
+                help="Used to convert load (tons) to a stress proxy."
+            )
         
-        st.markdown("---")
-        st.subheader("⚖️ Vehicle Weights (lbs)")
-        car_weight = st.number_input("Car", 2000, 6000, 4000, 500)
-        truck_weight = st.number_input("Truck", 15000, 80000, 35000, 5000)
-        bus_weight = st.number_input("Bus", 15000, 40000, 25000, 2500)
-        motorcycle_weight = st.number_input("Motorcycle", 200, 2000, 500, 50)
+        with st.expander("Vehicle Weights (Advanced)", expanded=False):
+            car_weight = st.number_input("Car", 2000, 6000, 4000, 500)
+            truck_weight = st.number_input("Truck", 15000, 80000, 35000, 5000)
+            bus_weight = st.number_input("Bus", 15000, 40000, 25000, 2500)
+            motorcycle_weight = st.number_input("Motorcycle", 200, 2000, 500, 50)
         
         # Update global weights
         # Update session state weights
@@ -2150,13 +2548,33 @@ def main():
         st.session_state.vehicle_weights['bus'] = bus_weight
         st.session_state.vehicle_weights['motorcycle'] = motorcycle_weight
         
-        st.markdown("---")
-        st.warning(
+        st.caption(
             "⚠️ **Proof-of-Concept**\n\n"
             "Fatigue scores are proxy metrics. "
             "Not validated against real sensors."
         )
     
+    with st.expander("Calibration (Advanced)", expanded=False):
+        # Load->stress mapping
+        k_mpa_per_ton = st.slider("k (MPa per ton)", 0.1, 2.0, 0.6, 0.1)
+        stress_ref_mpa = st.slider("Stress reference (MPa)", 20.0, 200.0, 80.0, 5.0)
+
+        # Miner damage params (proxy scale)
+        miner_m = st.slider("Miner m", 2, 6, 3, 1)
+        miner_C = st.number_input("Miner C", min_value=1e8, max_value=1e15, value=1e12, step=1e11, format="%.0e")
+
+        # Reliability resistance model (proxy)
+        mu_R = st.slider("μ_R (MPa)", 100.0, 600.0, 250.0, 10.0)
+        sigma_R = st.slider("σ_R (MPa)", 5.0, 150.0, 25.0, 5.0)
+
+    st.session_state.k_mpa_per_ton = k_mpa_per_ton
+    st.session_state.stress_ref_mpa = stress_ref_mpa
+    st.session_state.miner_m = miner_m
+    st.session_state.miner_C = miner_C
+    st.session_state.mu_R = mu_R
+    st.session_state.sigma_R = sigma_R
+
+
     # =========================================================================
     # LOAD MODELS
     # =========================================================================
@@ -2194,9 +2612,12 @@ def main():
         video_placeholder = st.empty()
         status_placeholder = st.empty()
         
-        # Auto-refresh button
-        if st.button("🔄 Refresh Frame"):
-            pass  # Just triggers rerun
+        with st.expander("Live feed controls", expanded=False):
+            if st.button("🔄 Refresh Frame"):
+                pass  # Just triggers rerun
+            auto_refresh_live = st.toggle("Auto-refresh live feed", value=True)
+            live_refresh_sec = st.slider("Live refresh (seconds)", 0.5, 5.0, 2.0, 0.5)
+            st.caption(f"Auto-refresh interval: {live_refresh_sec:.1f}s")
         
         # Capture frame
         status_placeholder.info("📡 Connecting to camera...")
@@ -2208,6 +2629,7 @@ def main():
             frame = capture_frame(camera_config["url"])
             
             if frame is not None:
+                now = datetime.now()
                 vehicle_data, annotated_frame, detections = detect_vehicles(
                     frame=frame,
                     model=st.session_state.yolo_model,
@@ -2217,10 +2639,27 @@ def main():
                     confidence=confidence,
                     bridge_config=bridge_config,
                     use_roi=st.session_state.get("use_roi", True),
-                    roi_override=st.session_state.get("roi_override", None)
+                    roi_override=st.session_state.get("roi_override", None),
+                    weights=st.session_state.get("vehicle_weights", VEHICLE_WEIGHTS)
                 )
+                k = float(st.session_state.get("k_mpa_per_ton", 0.6))
+                stress_mpa = load_tons_to_stress_mpa(
+                    vehicle_data.get("load_tons", 0.0),
+                    k_mpa_per_ton=k
+                )
+                vehicle_data["stress_mpa_proxy"] = round(stress_mpa, 2)
+                prev_detections = st.session_state.get("prev_detections")
+                prev_time = st.session_state.get("prev_detections_time")
+                if prev_detections is not None and prev_time is not None:
+                    dt_s = (now - prev_time).total_seconds()
+                    avg_speed_mps = estimate_avg_speed_mps(detections, prev_detections, dt_s)
+                    if avg_speed_mps is not None:
+                        vehicle_data["avg_speed_mps"] = round(avg_speed_mps, 2)
+                        vehicle_data["avg_speed_kph"] = round(avg_speed_mps * 3.6, 1)
                 st.session_state.vehicle_data = vehicle_data
                 st.session_state.latest_detections = detections
+                st.session_state.prev_detections = detections
+                st.session_state.prev_detections_time = now
                 
                 frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
                 video_placeholder.image(frame_rgb, width='stretch')
@@ -2233,7 +2672,7 @@ def main():
                     "load_tons": 42.5,
                     "density": 0.034
                 }
-    
+        
     with col_conditions:
         st.subheader("📊 Current Conditions")
         
@@ -2255,21 +2694,20 @@ def main():
             st.metric("Buses", leaving.get("bus", 0))
         
         st.metric("Load", f"{vd.get('load_tons', 0)} tons")
+        if vd.get("avg_speed_kph") is not None:
+            st.metric("Avg Speed", f"{vd.get('avg_speed_kph')} km/h")
     
-        st.markdown("---")
-        
-        # Weather
-        st.subheader("🌤️ Weather")
-        weather = fetch_weather(bridge_config.latitude, bridge_config.longitude)
-        st.session_state.weather = weather
-        
-        col_w1, col_w2 = st.columns(2)
-        with col_w1:
-            st.metric("Temp", f"{weather['temperature']}°C")
-            st.metric("Humidity", f"{weather['humidity']}%")
-        with col_w2:
-            st.metric("Precip", f"{weather['precipitation']} mm")
-            st.metric("F/T Cycles", weather['freeze_thaw_7day'])
+        with st.expander("Weather", expanded=False):
+            weather = fetch_weather(bridge_config.latitude, bridge_config.longitude)
+            st.session_state.weather = weather
+            
+            col_w1, col_w2 = st.columns(2)
+            with col_w1:
+                st.metric("Temp", f"{weather['temperature']}°C")
+                st.metric("Humidity", f"{weather['humidity']}%")
+            with col_w2:
+                st.metric("Precip", f"{weather['precipitation']} mm")
+                st.metric("F/T Cycles", weather['freeze_thaw_7day'])
 
         # Detection Distance & ROI Analysis
         if vd.get("detection_stats"):
@@ -2308,23 +2746,91 @@ def main():
         # show damage + reliability if available
         if st.session_state.session_log:
             latest = st.session_state.session_log[-1]
-            beta_latest = latest.get("reliability_index", None)
-            st.markdown("---")
-            st.subheader("🔧 Fatigue + Reliability")
 
-            st.metric("Fatigue Damage (Miner)", f"{latest.get('damage', 0.0):.6f}")
-            st.metric("Reliability Index β", f"{beta_latest:.2f}" if beta_latest is not None else "—")
+            st.markdown("---")
+            st.subheader("🔧 Fatigue + Reliability (Simulated vs Observed)")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Simulation (LWR → Miner)**")
+                st.metric("Damage (Miner)", f"{latest.get('sim_damage', 0.0):.6f}")
+                st.metric("Reliability β", f"{latest.get('sim_beta')}" if latest.get("sim_beta") is not None else "—")
+                st.metric("Shockwave", f"{latest.get('sim_shockwave', 0.0):.4f}")
+            with c2:
+                st.markdown("**Observed (YOLO load/speed → Miner)**")
+                st.metric("Damage (Miner)", f"{latest.get('obs_damage', 0.0):.6f}")
+                st.metric("Reliability β", f"{latest.get('obs_beta')}" if latest.get("obs_beta") is not None else "—")
+                if vd.get("avg_speed_kph") is not None:
+                    st.metric("Avg Speed", f"{vd.get('avg_speed_kph')} km/h")
+
+        with st.expander("🧠 Confidence & Events", expanded=False):
+            conf = compute_confidence_score(st.session_state.vehicle_data, st.session_state.weather, st.session_state.rf_metrics)
+            st.metric("Confidence", f"{conf['label']} ({conf['score']})")
+            st.write("Reasons:")
+            for r in conf["reasons"]:
+                st.write(f"- {r}")
+
+            if st.session_state.session_log:
+                ev = st.session_state.session_log[-1].get("events", [])
+                if ev:
+                    st.write("Events:")
+                    st.write(", ".join(ev))
+                else:
+                    st.write("Events: None")
+
+        if st.session_state.session_log:
+            latest = st.session_state.session_log[-1]
+            latest_beta = latest.get("beta_primary", None)
+            st.metric("Reliability β (Primary)", f"{latest_beta:.2f}" if latest_beta is not None else "—")
+
+            vd = latest.get("vehicle_data", {})
+
+            st.markdown("---")
+            st.subheader("🌊 Shockwave (Simulated vs Observed)")
+
+            c1, c2, c3 = st.columns(3)
+
+            with c1:
+                st.markdown("**Simulated (LWR)**")
+                st.metric("Shockwave speed", f"{float(latest.get('sim_shockwave', 0.0)):.4f}")
+
+            with c2:
+                st.markdown("**Observed (proxy)**")
+                st.metric("Shockwave intensity", f"{float(latest.get('obs_shockwave', 0.0)):.3f}")
+
+            with c3:
+                st.markdown("**Observed inputs**")
+                sp = vd.get("avg_speed_kph", None)
+                st.metric("Avg Speed", f"{sp} km/h" if sp is not None else "N/A")
+                st.metric("Density", f"{float(vd.get('density', 0.0)):.4f} veh/m")
+
+            with st.expander("How to interpret this", expanded=False):
+                st.write(
+                    "- **Simulated shockwave** comes from the LWR density gradients and the chosen free-flow speed.\n"
+                    "- **Observed shockwave** is a unitless proxy that increases when **speed drops** and/or **density rises quickly**.\n"
+                    "- These two values are not the same units; they are shown together for **consistency checking and realism**."
+                )
+
+    # Auto-refresh live feed
+    if auto_refresh_live and not st.session_state.monitoring_active:
+        time.sleep(live_refresh_sec)
+        st.rerun()
     
     # =========================================================================
     # MONITORING SESSION
     # =========================================================================
     st.markdown("---")
     st.subheader("📹 Monitoring Session")
-    
+
     col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1, 1, 2])
-    
+
     with col_ctrl1:
-        if st.button("▶️ START", type="primary", disabled=st.session_state.monitoring_active, width='stretch'):
+        if st.button(
+            "▶️ START",
+            type="primary",
+            disabled=st.session_state.monitoring_active or st.session_state.auto_monitoring_enabled or st.session_state.validation_active,
+            width='stretch'
+        ):
             st.session_state.monitoring_active = True
             st.session_state.monitoring_start_time = datetime.now()
             st.session_state.session_log = []
@@ -2333,18 +2839,35 @@ def main():
     with col_ctrl2:
         if st.button("⏹️ STOP", disabled=not st.session_state.monitoring_active, width='stretch'):
             st.session_state.monitoring_active = False
+            st.session_state.validation_active = False
             st.rerun()
     
     with col_ctrl3:
+        if st.session_state.auto_monitoring_enabled:
+            if not st.session_state.monitoring_active and not st.session_state.auto_monitoring_started:
+                st.session_state.monitoring_active = True
+                st.session_state.monitoring_start_time = datetime.now()
+                st.session_state.session_log = []
+                st.session_state.auto_monitoring_started = True
+                st.rerun()
+        else:
+            st.session_state.auto_monitoring_started = False
+
         if st.session_state.monitoring_active:
             start_time = st.session_state.monitoring_start_time
             if start_time is None:
                 start_time = datetime.now()
                 st.session_state.monitoring_start_time = start_time
             elapsed = (datetime.now() - start_time).total_seconds()
-            total_duration = monitor_duration * 60
+            if st.session_state.validation_active:
+                total_duration = st.session_state.validation_duration_min * 60
+            else:
+                total_duration = monitor_duration * 60
             captures_done = len(st.session_state.session_log)
-            expected_captures = int(total_duration / capture_interval)
+            if st.session_state.validation_active:
+                expected_captures = int(total_duration / st.session_state.validation_interval_sec)
+            else:
+                expected_captures = int(total_duration / capture_interval)
             
             progress = min(elapsed / total_duration, 1.0)
             st.progress(progress, text=f"Capture {captures_done}/{expected_captures} | {int(elapsed)}s / {total_duration}s")
@@ -2352,6 +2875,7 @@ def main():
             # Check if session complete
             if elapsed >= total_duration:
                 st.session_state.monitoring_active = False
+                st.session_state.validation_active = False
                 st.success("✅ Monitoring session complete!")
     
     # Monitoring loop
@@ -2361,17 +2885,23 @@ def main():
             start_time = datetime.now()
             st.session_state.monitoring_start_time = start_time
         elapsed = (datetime.now() - start_time).total_seconds()
-        total_duration = monitor_duration * 60
+        if st.session_state.validation_active:
+            total_duration = st.session_state.validation_duration_min * 60
+            active_capture_interval = st.session_state.validation_interval_sec
+        else:
+            total_duration = monitor_duration * 60
+            active_capture_interval = capture_interval
         
         if elapsed < total_duration:
             captures_done = len(st.session_state.session_log)
-            next_capture_at = captures_done * capture_interval
+            next_capture_at = captures_done * active_capture_interval
             
             if elapsed >= next_capture_at:
                 # Time to capture
                 frame = capture_frame(camera_config["url"])
                 
                 if frame is not None:
+                    now = datetime.now()
                     vehicle_data, annotated_frame, detections = detect_vehicles(
                                             frame=frame,
                                             model=st.session_state.yolo_model,  
@@ -2383,25 +2913,69 @@ def main():
                                             use_roi=st.session_state.get("use_roi", True),
                                             roi_override=st.session_state.get("roi_override", None)
                                         )
+                    k = float(st.session_state.get("k_mpa_per_ton", 0.6))
+                    stress_mpa = load_tons_to_stress_mpa(
+                        vehicle_data.get("load_tons", 0.0),
+                        k_mpa_per_ton=k
+                    )
+                    vehicle_data["stress_mpa_proxy"] = round(stress_mpa, 2)
+                    prev_detections = st.session_state.get("prev_detections")
+                    prev_time = st.session_state.get("prev_detections_time")
+                    if prev_detections is not None and prev_time is not None:
+                        dt_s = (now - prev_time).total_seconds()
+                        avg_speed_mps = estimate_avg_speed_mps(detections, prev_detections, dt_s)
+                        if avg_speed_mps is not None:
+                            vehicle_data["avg_speed_mps"] = round(avg_speed_mps, 2)
+                            vehicle_data["avg_speed_kph"] = round(avg_speed_mps * 3.6, 1)
+                    st.session_state.prev_detections = detections
+                    st.session_state.prev_detections_time = now
                     st.session_state.latest_detections = detections
                     
-                    # Run LWR simulation with this density
-                    sim = run_lwr_simulation(
-                        initial_density=vehicle_data.get("density", 0.03),
+                    # -----------------------------
+                    # REALISM SPLIT (Sim vs Observed)
+                    # -----------------------------
+
+                    # Observed signals from camera
+                    density = float(vehicle_data.get("density", 0.03) or 0.03)
+                    avg_speed_mps = vehicle_data.get("avg_speed_mps", None)
+
+                    # Use observed speed to set LWR free-flow v_max (shockwave realism)
+                    v_max_mps = choose_vmax_from_observed_speed(avg_speed_mps)
+
+                    # Observed load (from YOLO counts × weights)
+                    load_tons = float(vehicle_data.get("load_tons", 0.0) or 0.0)
+                    stress_ref_mpa = float(st.session_state.get("stress_ref_mpa", 80.0))
+
+                    # Simulated block: LWR -> Miner -> beta
+                    sim_pack = compute_simulated_damage_beta(
+                        density=density,
                         road_length_m=bridge_config.total_length_m,
-                        v_max_mps=22.2  # 80 km/h default
+                        v_max_mps=v_max_mps,
+                        inject_jam=False,
+                        miner_m=int(st.session_state.get("miner_m", 3)),
+                        miner_C=float(st.session_state.get("miner_C", 1e12)),
+                        mu_R=float(st.session_state.get("mu_R", 250.0)),
+                        sigma_R=float(st.session_state.get("sigma_R", 25.0)),
+                        stress_ref_mpa=stress_ref_mpa,
                     )
 
-                    # Compute fatigue damage using Miner’s Rule
-                    damage, mu_S, sigma_S = compute_fatigue_damage(sim["stress_history"])
-
-                    if damage < 1e-6 or (mu_S < 1e-3 and sigma_S < 1e-3):
-                        beta = None  # too low to be meaningful
-                    else:
-                        beta = compute_reliability_index(mu_S=mu_S, sigma_S=sigma_S)
+                    vehicle_data["sim_shockwave_speed"] = round(sim_pack["sim_shockwave"], 4)
+                    vehicle_data["sim_fatigue"] = round(sim_pack["sim"]["fatigue"], 2)
 
 
-                    # Include in log
+                    obs_pack = compute_observed_damage_beta(
+                        load_tons=load_tons,
+                        density=density,
+                        avg_speed_mps=avg_speed_mps,
+                        miner_m=int(st.session_state.get("miner_m", 3)),
+                        miner_C=float(st.session_state.get("miner_C", 1e12)),
+                        mu_R=float(st.session_state.get("mu_R", 250.0)),
+                        sigma_R=float(st.session_state.get("sigma_R", 25.0)),
+                        stress_ref_mpa=stress_ref_mpa,
+                    )
+
+
+                    # Log entry (store both)
                     frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
                     st.session_state.latest_frame_rgb = frame_rgb
                     st.session_state.latest_frame_time = datetime.now()
@@ -2410,18 +2984,33 @@ def main():
                     pil_img.save(buffer, format="JPEG", quality=80)
                     img_b64 = base64.b64encode(buffer.getvalue()).decode()
 
-                    st.session_state.session_log.append({
+                    entry = {
                         "timestamp": datetime.now(),
                         "vehicle_data": vehicle_data,
                         "image_b64": img_b64,
-                        "damage": round(damage, 6),
-                        "reliability_index": round(beta, 2) if beta is not None else None
-                    })
-                    
-                    # Cap log size to prevent memory issues (keep last 500 entries)
-                    MAX_LOG_SIZE = 500
-                    if len(st.session_state.session_log) > MAX_LOG_SIZE:
-                        st.session_state.session_log = st.session_state.session_log[-MAX_LOG_SIZE:]
+                        **sim_pack,
+                        **obs_pack,
+                    }
+
+                    # One headline reliability number for UI/report
+                    entry["beta_primary"] = (
+                        entry.get("obs_beta")
+                        if entry.get("obs_beta") is not None
+                        else entry.get("sim_beta")
+                    )
+                    # Observed shockwave proxy (explicit, explainable)
+                    # NOTE: uses session_log[-1] vs session_log[-2], so append first OR compute with a temp list:
+                    temp_log = st.session_state.session_log + [entry]
+                    entry["obs_shockwave"] = compute_observed_shockwave_proxy(temp_log)
+
+                    st.session_state.session_log.append(entry)
+
+                    # Add events + gaps
+                    latest_entry = st.session_state.session_log[-1]
+                    latest_entry["events"] = detect_events(st.session_state.session_log)
+                    latest_entry.update(compute_sim_obs_gap(latest_entry))
+                    latest_beta = latest_entry.get("beta_primary", None)
+
             
             # Auto-refresh for next capture
             time.sleep(2)
@@ -2462,8 +3051,21 @@ def main():
                 "outgoing_trucks": entry["vehicle_data"]["leaving"]["truck"],
                 "outgoing_buses": entry["vehicle_data"]["leaving"]["bus"],
                 "load_tons": entry["vehicle_data"]["load_tons"],
-                "fatigue_damage": entry.get("damage", 0.0),
-                "reliability_index": entry.get("reliability_index", 0.0)
+                "fatigue_damage_sim": entry.get("sim_damage", 0.0),
+                "fatigue_damage_obs": entry.get("obs_damage", 0.0),
+                "beta_sim": entry.get("sim_beta", None),
+                "beta_obs": entry.get("obs_beta", None),
+                "beta_primary": entry.get("beta_primary", None),
+                "sim_damage": entry.get("sim_damage", 0.0),
+                "sim_beta": entry.get("sim_beta", None),
+                "sim_shockwave": entry.get("sim_shockwave", 0.0),
+                "obs_damage": entry.get("obs_damage", 0.0),
+                "obs_beta": entry.get("obs_beta", None),
+                "stress_mpa_proxy": entry["vehicle_data"].get("stress_mpa_proxy", None),
+                "gap_damage": entry.get("gap_damage", 0.0),
+                "gap_beta": entry.get("gap_beta", None),
+                "events": ",".join(entry.get("events", [])),
+                "beta_primary": entry.get("beta_primary", None),
             }
             for entry in st.session_state.session_log
         ])
@@ -2499,9 +3101,15 @@ def main():
         hourly_summary = df_log.groupby("hour").agg({
             "vehicles": "sum",
             "load_tons": "mean",
-            "fatigue_damage": "mean",
-            "reliability_index": "mean"
+            "damage_primary": "mean",
+            "beta_primary": "mean"
         }).reset_index()
+
+        df_log["damage_primary"] = np.where(
+            df_log["fatigue_damage_obs"].notna(),
+            df_log["fatigue_damage_obs"],
+            df_log["fatigue_damage_sim"]
+        )
 
         hourly_summary.rename(columns={
             "hour": "Hour",
@@ -2625,17 +3233,18 @@ def main():
             with st.expander("🔍 DEBUG: Model Training Details", expanded=True):
                 col_d1, col_d2, col_d3 = st.columns(3)
                 with col_d1:
-                    st.metric("Training Samples", metrics.get("training_samples", "N/A"))
+                    st.metric("Training Samples", metrics.get("samples", "N/A"))
                 with col_d2:
-                    st.metric("R² Score", f"{metrics.get('r2', 0):.3f}")
+                    st.metric("CV R² (mean)", f"{metrics.get('cv_r2_mean', 0):.3f}")
                 with col_d3:
-                    st.metric("MAE", f"{metrics.get('mae', 0):.2f}")
+                    st.metric("CV MAE (mean)", f"{metrics.get('cv_mae_mean', 0):.2f}")
+                    
                 
                 st.markdown("**Features Used:**")
                 st.write(metrics.get("features_used", []))
                 
                 st.markdown("**Feature Importance (Top 5):**")
-                importance = metrics.get("feature_importance", {})
+                importance = metrics.get("feature_importance_mean", {})
                 for i, (feat, imp) in enumerate(list(importance.items())[:5]):
                     st.write(f"{i+1}. **{feat}**: {imp:.3f}")
                 
@@ -2711,13 +3320,14 @@ def main():
             truck_pct,
             scenario_freeze,
             scenario_temp,
-            scenario_precip
+            scenario_precip,
+            bridge_config.age_years
         )
-        
+        bridge_age = bridge_config.age_years
         with col_result:
             st.subheader("Fatigue Prediction")
             
-            status_text, status_color = get_status(scenario["combined_fatigue"])
+            status_text, _ = get_status(scenario["combined_fatigue"])
             
             # Big score display
             st.markdown(
@@ -2866,6 +3476,8 @@ def main():
             st.subheader("📉 Reliability Index Over Time")
             fig_beta = plot_reliability_over_time(st.session_state.session_log)
             st.plotly_chart(fig_beta, width='stretch')
+            if st.session_state.session_log and len(st.session_state.session_log) >= 2:
+                st.plotly_chart(plot_sim_obs_over_time(st.session_state.session_log), width='stretch')
 
         
         # =====================================================================
