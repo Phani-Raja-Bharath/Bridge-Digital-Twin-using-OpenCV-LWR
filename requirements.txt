@@ -1,9 +1,22 @@
+# Core app
 streamlit>=1.39
+
+# Computer Vision & DL
 ultralytics>=8.0
-plotly>=5.20
-scikit-learn>=1.3
-scipy>=1.10
 opencv-python>=4.8
 pillow>=10.0
+
+# Data & Math
 numpy>=1.24
 pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+
+# Visualization
+plotly>=5.20
+
+# Media / Streaming
+yt-dlp[default]
+
+# Utilities
+requests>=2.31
