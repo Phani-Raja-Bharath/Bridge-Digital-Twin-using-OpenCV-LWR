@@ -2439,6 +2439,7 @@ def main():
         df_log = pd.DataFrame([
             {
                 "timestamp": entry["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
+                "vehicles": entry["vehicle_data"]["approaching"]["total"],
                 "incoming": entry["vehicle_data"]["approaching"]["total"],
                 "incoming_cars": entry["vehicle_data"]["approaching"]["car"],
                 "incoming_trucks": entry["vehicle_data"]["approaching"]["truck"],
