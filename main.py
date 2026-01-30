@@ -99,6 +99,7 @@ CAMERA_CALIBRATION = {
     "focal_length_px": 800,       # Estimated focal length in pixels
     "typical_car_width_m": 1.8,   # Average car width
     "typical_truck_width_m": 2.5, # Average truck width
+    "typical_motorcycle_width_m": 0.8, # Average motorcycle width
     "lane_width_m": 3.6,          # Standard lane width
     "camera_height_m": 10,        # Estimated camera mounting height
     "camera_fov_deg": 60,         # Approximate field of view
@@ -108,7 +109,8 @@ CAMERA_CALIBRATION = {
 def estimate_vehicle_distance(
     bbox_width_px: int,
     frame_width_px: int,
-    vehicle_type: str = "car"
+    vehicle_type: str = "car",
+    focal_length_px: Optional[float] = None,
 ) -> Dict:
     """
     Estimate distance to vehicle based on bounding box size.
@@ -124,18 +126,22 @@ def estimate_vehicle_distance(
         real_width = CAMERA_CALIBRATION["typical_truck_width_m"]
     elif vehicle_type == "bus":
         real_width = 2.5
+    elif vehicle_type == "motorcycle":
+        real_width = CAMERA_CALIBRATION["typical_motorcycle_width_m"]
     else:
         real_width = CAMERA_CALIBRATION["typical_car_width_m"]
     
     # Estimate focal length from FOV if not calibrated
-    fov_rad = np.radians(CAMERA_CALIBRATION["camera_fov_deg"])
-    focal_length = (frame_width_px / 2) / np.tan(fov_rad / 2)
-    
-    # Calculate distance
-    if bbox_width_px > 10:
-        distance_m = (real_width * focal_length) / bbox_width_px
+    if focal_length_px is not None:
+        focal_length = float(focal_length_px)
     else:
-        distance_m = 999  # Invalid
+        fov_rad = np.radians(CAMERA_CALIBRATION["camera_fov_deg"])
+        focal_length = (frame_width_px / 2) / np.tan(fov_rad / 2)
+    
+    # Calculate distance (clamp bbox width to reduce blow-ups)
+    min_width_px = 10
+    safe_width = max(int(bbox_width_px), min_width_px)
+    distance_m = (real_width * focal_length) / safe_width
     
     # Estimate angle from center
     # (This would need bbox center_x, adding as placeholder)
@@ -727,6 +733,7 @@ def detect_vehicles(
     use_roi: bool = True,
     roi_override: Optional[Dict] = None,
     weights: Optional[Dict[str, float]] = None,
+    focal_length_px: Optional[float] = None,
 ) -> Tuple[Dict, np.ndarray, list]:
     """
     Detect vehicles with ROI box and distance estimation.
@@ -800,7 +807,12 @@ def detect_vehicles(
                 in_roi = is_in_roi(center_x, center_y, roi_pixels) if use_roi else True
                 
                 # Estimate distance
-                dist_info = estimate_vehicle_distance(bbox_width, width, vehicle_type)
+                dist_info = estimate_vehicle_distance(
+                    bbox_width,
+                    width,
+                    vehicle_type,
+                    focal_length_px=focal_length_px,
+                )
                 
                 # Store detection details
                 detection = {
@@ -894,7 +906,15 @@ def detect_vehicles(
         return {}, frame, []
 
 
-def estimate_avg_speed_mps(detections: list, prev_detections: list, dt_s: float) -> Optional[float]:
+def estimate_avg_speed_mps(
+    detections: list,
+    prev_detections: list,
+    dt_s: float,
+    max_match_dist_px: float = 200.0,
+    dt_min_s: Optional[float] = None,
+    dt_max_s: Optional[float] = None,
+    deadband_m: float = 0.0,
+) -> Optional[float]:
     """
     Estimate average speed (m/s) by matching detections across frames.
     Uses nearest-center matching within a pixel threshold, same type and side.
@@ -902,7 +922,14 @@ def estimate_avg_speed_mps(detections: list, prev_detections: list, dt_s: float)
     if not detections or not prev_detections or dt_s <= 0:
         return None
 
-    max_match_dist_sq = 200 * 200
+    if dt_min_s is not None and dt_s < dt_min_s:
+        dt_s = dt_min_s
+    if dt_max_s is not None and dt_s > dt_max_s:
+        dt_s = dt_max_s
+    if dt_s <= 0:
+        return None
+
+    max_match_dist_sq = float(max_match_dist_px) * float(max_match_dist_px)
     speeds = []
 
     for det in detections:
@@ -926,13 +953,82 @@ def estimate_avg_speed_mps(detections: list, prev_detections: list, dt_s: float)
         prev_dist = best.get("distance_m")
         if prev_dist is None:
             continue
-        speed = abs(det["distance_m"] - prev_dist) / dt_s
+        dist_delta = abs(det["distance_m"] - prev_dist)
+        if deadband_m > 0.0 and dist_delta < deadband_m:
+            speed = 0.0
+        else:
+            speed = dist_delta / dt_s
         if 0 <= speed <= 60:
             speeds.append(speed)
 
     if not speeds:
         return None
-    return float(np.mean(speeds))
+    return float(np.median(speeds))
+
+
+def estimate_avg_speed_mps_pixel(
+    detections: list,
+    prev_detections: list,
+    dt_s: float,
+    meters_per_pixel: float,
+    axis: str = "x",
+    max_match_dist_px: float = 200.0,
+    dt_min_s: Optional[float] = None,
+    dt_max_s: Optional[float] = None,
+    deadband_px: float = 0.0,
+) -> Optional[float]:
+    """
+    Estimate average speed (m/s) using pixel displacement along a chosen axis.
+    Axis is 'x', 'y', or 'diag' (euclidean). meters_per_pixel is a simple scale.
+    """
+    if not detections or not prev_detections or dt_s <= 0:
+        return None
+    if dt_min_s is not None and dt_s < dt_min_s:
+        dt_s = dt_min_s
+    if dt_max_s is not None and dt_s > dt_max_s:
+        dt_s = dt_max_s
+    if dt_s <= 0:
+        return None
+
+    max_match_dist_sq = float(max_match_dist_px) * float(max_match_dist_px)
+    speeds = []
+
+    for det in detections:
+        best = None
+        best_dist_sq = None
+        for prev in prev_detections:
+            if prev.get("type") != det.get("type"):
+                continue
+            if prev.get("side") != det.get("side"):
+                continue
+            dx = det["center"][0] - prev["center"][0]
+            dy = det["center"][1] - prev["center"][1]
+            dist_sq = dx * dx + dy * dy
+            if best_dist_sq is None or dist_sq < best_dist_sq:
+                best = prev
+                best_dist_sq = dist_sq
+        if best is None or best_dist_sq is None or best_dist_sq > max_match_dist_sq:
+            continue
+
+        dx = det["center"][0] - best["center"][0]
+        dy = det["center"][1] - best["center"][1]
+        if axis == "y":
+            disp_px = abs(dy)
+        elif axis == "diag":
+            disp_px = float(np.hypot(dx, dy))
+        else:
+            disp_px = abs(dx)
+
+        if deadband_px > 0.0 and disp_px < deadband_px:
+            speed = 0.0
+        else:
+            speed = (disp_px * float(meters_per_pixel)) / dt_s
+        if 0 <= speed <= 60:
+            speeds.append(speed)
+
+    if not speeds:
+        return None
+    return float(np.median(speeds))
 
 def load_tons_to_stress_mpa(load_tons: float, k_mpa_per_ton: float = 0.6) -> float:
     """
@@ -2518,17 +2614,66 @@ def main():
         st.session_state.monitoring_active = False
         st.session_state.monitoring_start_time = None
         st.session_state.session_log = []  # List of {timestamp, vehicle_data, image_b64}
+    if "live_capture_log" not in st.session_state:
+        st.session_state.live_capture_log = []
+    if "auto_monitoring_enabled" not in st.session_state:
         st.session_state.auto_monitoring_enabled = False
+    if "auto_monitoring_started" not in st.session_state:
         st.session_state.auto_monitoring_started = False
+    if "validation_active" not in st.session_state:
         st.session_state.validation_active = False
+    if "validation_duration_min" not in st.session_state:
         st.session_state.validation_duration_min = 60
+    if "validation_interval_sec" not in st.session_state:
         st.session_state.validation_interval_sec = 30
+    if "k_mpa_per_ton" not in st.session_state:
         st.session_state.k_mpa_per_ton = 0.6
+    if "stress_ref_mpa" not in st.session_state:
         st.session_state.stress_ref_mpa = 80.0
+    if "prev_detections" not in st.session_state:
         st.session_state.prev_detections = None
+    if "prev_detections_time" not in st.session_state:
         st.session_state.prev_detections_time = None
+    if "latest_frame_rgb" not in st.session_state:
         st.session_state.latest_frame_rgb = None
+    if "latest_frame_time" not in st.session_state:
         st.session_state.latest_frame_time = None
+    if "last_capture_time" not in st.session_state:
+        st.session_state.last_capture_time = None
+    if "speed_ema_mps" not in st.session_state:
+        st.session_state.speed_ema_mps = None
+    if "speed_mode" not in st.session_state:
+        st.session_state.speed_mode = "depth"
+    if "pixel_m_per_px" not in st.session_state:
+        st.session_state.pixel_m_per_px = 0.05
+    if "pixel_axis" not in st.session_state:
+        st.session_state.pixel_axis = "x"
+    if "focal_length_px" not in st.session_state:
+        st.session_state.focal_length_px = None
+    if "experiment_runs" not in st.session_state:
+        st.session_state.experiment_runs = []
+        st.session_state.experiment_run_active = False
+        st.session_state.experiment_run_id = 0
+        st.session_state.exp_settings = {
+            "interval_sec": 1.0,
+            "duration_min": 10,
+            "confidence": 0.15,
+            "use_roi": True,
+            "roi": None,
+            "traffic_weight": 0.70,
+            "environment_weight": 0.30,
+            "use_live_weather": True,
+            "enabled": False
+        }
+    if "experiment_mode" not in st.session_state:
+        st.session_state.experiment_mode = False
+        st.session_state.exp_density = 0.05
+        st.session_state.exp_vmax = 80
+        st.session_state.exp_jam = False
+        st.session_state.run_single_experiment = False
+        st.session_state.experiment_log = []
+    if "log_detections_for_validation" not in st.session_state:
+        st.session_state.log_detections_for_validation = False
     
     if "yolo_model" not in st.session_state:
         with st.spinner("Loading YOLO model..."):
@@ -2547,80 +2692,258 @@ def main():
     )
     
     # =========================================================================
-    # SIDEBAR
+    # STAGE 1: VIDEO SOURCE & MONITORING CONTROLS
     # =========================================================================
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        
-        # Camera selection
-        selected_camera = st.selectbox("📹 Camera", list(CAMERAS.keys()))
+    st.markdown("### 📹 Video Source")
+    
+    col_source, col_monitor = st.columns([2, 1])
+    
+    with col_source:
+        selected_camera = st.selectbox("Camera", list(CAMERAS.keys()), label_visibility="collapsed")
         camera_config = CAMERAS[selected_camera]
+    
+    with col_monitor:
+        col_start, col_stop = st.columns(2)
+        with col_start:
+            start_btn = st.button("▶️ START", type="primary", 
+                                  disabled=st.session_state.monitoring_active,
+                                  use_container_width=True)
+        with col_stop:
+            stop_btn = st.button("⏹️ STOP", 
+                                 disabled=not st.session_state.monitoring_active,
+                                 use_container_width=True)
         
-        st.subheader("Detection")
-        lane_divider = st.slider("Lane Divider", 0.3, 0.7, 0.43, 0.01)
-        confidence = st.slider("Confidence", 0.05, 0.50, 0.15, 0.05)
+        if start_btn:
+            st.session_state.monitoring_active = True
+            st.session_state.monitoring_start_time = datetime.now()
+            st.session_state.session_log = []
+            st.rerun()
+        if stop_btn:
+            st.session_state.monitoring_active = False
+            st.session_state.validation_active = False
+            st.rerun()
+    
+    # Capture settings inline
+    col_interval, col_duration, col_auto = st.columns(3)
+    with col_interval:
+        capture_interval = st.select_slider(
+            "Capture every",
+            options=[0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 5.0, 7.5, 10.0],
+            value=2.0,
+            format_func=lambda x: f"{x}s"
+        )
+    with col_duration:
+        monitor_duration = st.select_slider(
+            "Duration",
+            options=[10, 15, 20],
+            value=15,
+            format_func=lambda x: f"{x} min"
+        )
+    with col_auto:
+        auto_monitoring_enabled = st.toggle(
+            "Auto-capture",
+            value=st.session_state.auto_monitoring_enabled,
+            help="Automatically run a monitoring session"
+        )
+        st.session_state.auto_monitoring_enabled = auto_monitoring_enabled
 
-        with st.expander("ROI (Advanced)", expanded=False):
-            use_roi = st.checkbox("Enable ROI Box", value=True, 
-                                  help="Only count vehicles within the defined box")
-            
-            if use_roi:
-                st.markdown("*Adjust ROI boundaries (% of frame)*")
-                col_roi1, col_roi2 = st.columns(2)
-                with col_roi1:
-                    roi_x1 = st.slider("Left edge %", 0, 50, 20, key="roi_x1")
-                    roi_y1 = st.slider("Top edge %", 0, 50, 35, key="roi_y1")
-                with col_roi2:
-                    roi_x2 = st.slider("Right edge %", 50, 100, 80, key="roi_x2")
-                    roi_y2 = st.slider("Bottom edge %", 50, 100, 75, key="roi_y2")
-                
-                roi_override = {
-                    "x1_pct": roi_x1 / 100,
-                    "y1_pct": roi_y1 / 100,
-                    "x2_pct": roi_x2 / 100,
-                    "y2_pct": roi_y2 / 100
-                }
-            else:
-                roi_override = None
+    # =========================================================================
+    # STAGE 2: DETECTION SETTINGS
+    # =========================================================================
+    with st.expander("🔍 Detection Settings", expanded=False):
+        col_det1, col_det2, col_det3 = st.columns(3)
         
-        # Store in session state
+        with col_det1:
+            confidence = st.slider("Confidence", 0.05, 0.50, 0.15, 0.05)
+        with col_det2:
+            lane_divider = st.slider("Lane Divider", 0.3, 0.7, 0.43, 0.01)
+        with col_det3:
+            speed_mode = st.selectbox(
+                "Speed Mode",
+                ["depth", "pixel"],
+                index=0 if st.session_state.speed_mode == "depth" else 1,
+                help="Depth: bbox width | Pixel: center displacement"
+            )
+            st.session_state.speed_mode = speed_mode
+        
+        if speed_mode == "pixel":
+            col_axis, col_scale = st.columns(2)
+            with col_axis:
+                st.session_state.pixel_axis = st.selectbox(
+                    "Pixel axis", ["x", "y", "diag"], 
+                    index=["x", "y", "diag"].index(st.session_state.pixel_axis)
+                )
+            with col_scale:
+                st.session_state.pixel_m_per_px = st.slider(
+                    "Meters/pixel", 0.005, 0.20, 
+                    float(st.session_state.pixel_m_per_px), 0.005
+                )
+        
+        # ROI Settings
+        st.markdown("**ROI (Region of Interest)**")
+        use_roi = st.checkbox("Enable ROI Box", value=True,
+                              help="Only count vehicles within the defined box")
+        
+        if use_roi:
+            col_roi1, col_roi2, col_roi3, col_roi4 = st.columns(4)
+            with col_roi1:
+                roi_x1 = st.slider("Left %", 0, 50, 20, key="roi_x1")
+            with col_roi2:
+                roi_y1 = st.slider("Top %", 0, 50, 35, key="roi_y1")
+            with col_roi3:
+                roi_x2 = st.slider("Right %", 50, 100, 80, key="roi_x2")
+            with col_roi4:
+                roi_y2 = st.slider("Bottom %", 50, 100, 75, key="roi_y2")
+            
+            roi_override = {
+                "x1_pct": roi_x1 / 100,
+                "y1_pct": roi_y1 / 100,
+                "x2_pct": roi_x2 / 100,
+                "y2_pct": roi_y2 / 100
+            }
+        else:
+            roi_override = None
+        
         st.session_state.use_roi = use_roi
         st.session_state.roi_override = roi_override
 
-        with st.expander("Monitoring Session", expanded=True):
-            capture_interval = st.select_slider(
-                "Capture every",
-                options=[0.5, 0.75, 1.0, 1.25,1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 5.0, 10.0, 15.0, 30.0],
-                value=30,
-                format_func=lambda x: f"{x} sec" if x < 60 else f"{x//60} min"
+    # =========================================================================
+    # STAGE 3: ADVANCED SETTINGS (collapsed by default)
+    # =========================================================================
+    with st.expander("⚙️ Advanced Settings", expanded=False):
+        adv_tab1, adv_tab2, adv_tab3, adv_tab4 = st.tabs([
+            "🚗 Vehicle Weights", "🧪 Experiments", "📊 Simulation", "✅ Validation"
+        ])
+        
+        with adv_tab1:
+            col_w1, col_w2 = st.columns(2)
+            with col_w1:
+                car_weight = st.number_input("Car (lbs)", 2000, 6000, 4000, 500)
+                truck_weight = st.number_input("Truck (lbs)", 15000, 80000, 35000, 5000)
+            with col_w2:
+                bus_weight = st.number_input("Bus (lbs)", 15000, 40000, 25000, 2500)
+                motorcycle_weight = st.number_input("Motorcycle (lbs)", 200, 2000, 500, 50)
+            
+            st.session_state.vehicle_weights['car'] = car_weight
+            st.session_state.vehicle_weights['truck'] = truck_weight
+            st.session_state.vehicle_weights['bus'] = bus_weight
+            st.session_state.vehicle_weights['motorcycle'] = motorcycle_weight
+        
+        with adv_tab2:
+            experiment_mode = st.toggle("Enable Experiment Mode", value=st.session_state.experiment_mode)
+            st.session_state.experiment_mode = experiment_mode
+            
+            if experiment_mode:
+                col_exp1, col_exp2 = st.columns(2)
+                with col_exp1:
+                    exp_density = st.slider("Density (veh/m)", 0.01, 0.15, st.session_state.exp_density, 0.005)
+                    exp_jam = st.checkbox("Inject Jam Event", value=st.session_state.exp_jam)
+                with col_exp2:
+                    exp_vmax = st.slider("Free-flow Speed (km/h)", 40, 120, st.session_state.exp_vmax, 5)
+                    if st.button("▶️ Run Experiment"):
+                        st.session_state.run_single_experiment = True
+                
+                st.session_state.exp_density = exp_density
+                st.session_state.exp_vmax = exp_vmax
+                st.session_state.exp_jam = exp_jam
+            
+            st.markdown("---")
+            exp_on = st.toggle(
+                "Enable Experiment Settings",
+                value=st.session_state.get("exp_settings", {}).get("enabled", False),
+                help="Apply custom settings for experiment runs"
             )
-            monitor_duration = st.select_slider(
-                "Duration",
-                options=[1, 2, 5, 10, 15, 30, 60],
-                value=5,
-                format_func=lambda x: f"{x} min"
+            
+            if exp_on:
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    exp_interval = st.slider("Interval (sec)", 0.5, 10.0,
+                        float(st.session_state.get("exp_settings", {}).get("interval_sec", 1.0)), 0.5)
+                    exp_conf = st.slider("Confidence", 0.05, 0.50,
+                        float(st.session_state.get("exp_settings", {}).get("confidence", confidence)), 0.05)
+                    traffic_w = st.slider("Traffic weight", 0.0, 1.0,
+                        float(st.session_state.get("exp_settings", {}).get("traffic_weight", 0.70)), 0.05)
+                with col_e2:
+                    exp_duration = st.slider("Duration (min)", 10, 20,
+                        int(st.session_state.get("exp_settings", {}).get("duration_min", 10)), 1)
+                    exp_use_roi = st.checkbox("Use ROI", value=bool(st.session_state.get("use_roi", True)))
+                    use_live_weather = st.checkbox("Use live weather",
+                        value=bool(st.session_state.get("exp_settings", {}).get("use_live_weather", True)))
+                
+                env_w = round(1.0 - traffic_w, 2)
+                roi_snap = st.session_state.get("roi_override", None)
+                
+                if st.button("🚀 Apply & Run Experiment", type="primary"):
+                    st.session_state.exp_settings = {
+                        "enabled": exp_on,
+                        "interval_sec": float(exp_interval),
+                        "duration_min": int(exp_duration),
+                        "confidence": float(exp_conf),
+                        "use_roi": bool(exp_use_roi),
+                        "roi": roi_snap,
+                        "traffic_weight": float(traffic_w),
+                        "environment_weight": float(env_w),
+                        "use_live_weather": bool(use_live_weather),
+                    }
+                    st.session_state.use_roi = bool(exp_use_roi)
+                    st.session_state.roi_override = roi_snap
+                    st.session_state.experiment_run_id = int(st.session_state.get("experiment_run_id", 0)) + 1
+                    st.session_state.experiment_run_active = True
+                    st.session_state.monitoring_active = True
+                    st.session_state.monitoring_start_time = datetime.now()
+                    st.session_state.session_log = []
+                    st.session_state.auto_monitoring_enabled = False
+                    st.session_state.validation_active = False
+                    st.rerun()
+            
+            if st.session_state.get("experiment_runs"):
+                st.markdown("**Experiment History**")
+                st.dataframe(
+                    pd.DataFrame(st.session_state.experiment_runs)[
+                        ["run_id", "start", "end", "captures", "avg_load_tons", "max_beta", "alerts"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True
+                )
+                if st.button("Clear History"):
+                    st.session_state.experiment_runs = []
+        
+        with adv_tab3:
+            col_sim1, col_sim2 = st.columns(2)
+            with col_sim1:
+                mc_runs = st.slider("Monte Carlo Runs", 50, 300, 100, 50)
+                jam_probability = st.slider("Jam Probability", 0.0, 1.0, 0.3, 0.1)
+            with col_sim2:
+                st.session_state.k_mpa_per_ton = st.slider(
+                    "Stress proxy k (MPa/ton)", 0.1, 2.0,
+                    float(st.session_state.k_mpa_per_ton), 0.1,
+                    help="Convert load (tons) to stress proxy"
+                )
+            
+            st.session_state.log_detections_for_validation = st.checkbox(
+                "Log detections for validation (memory heavy)",
+                value=st.session_state.log_detections_for_validation
             )
-            auto_monitoring_enabled = st.toggle(
-                "Fixed-time capture",
-                value=st.session_state.auto_monitoring_enabled,
-                help="Automatically run a monitoring session for the selected duration."
-            )
-            st.session_state.auto_monitoring_enabled = auto_monitoring_enabled
-
-        with st.expander("Validation Run", expanded=False):
-            validation_interval = st.select_slider(
-                "Validation capture every",
-                options=[10, 15, 30, 45, 60, 120, 300],
-                value=st.session_state.validation_interval_sec,
-                format_func=lambda x: f"{x} sec" if x < 60 else f"{x//60} min"
-            )
-            validation_duration = st.select_slider(
-                "Validation duration",
-                options=[10, 15, 30, 45, 60, 90, 120],
-                value=st.session_state.validation_duration_min,
-                format_func=lambda x: f"{x} min"
-            )
-            if st.button("▶️ Start Validation Run"):
+        
+        with adv_tab4:
+            st.markdown("**Validation Run Settings**")
+            col_v1, col_v2 = st.columns(2)
+            with col_v1:
+                validation_interval = st.select_slider(
+                    "Capture every",
+                    options=[10, 15, 30, 45, 60, 120, 300],
+                    value=st.session_state.validation_interval_sec,
+                    format_func=lambda x: f"{x}s" if x < 60 else f"{x//60}m"
+                )
+            with col_v2:
+                validation_duration = st.select_slider(
+                    "Duration",
+                    options=[10, 15, 30, 45, 60, 90, 120],
+                    value=st.session_state.validation_duration_min,
+                    format_func=lambda x: f"{x} min"
+                )
+            
+            if st.button("▶️ Start Validation Run", type="primary"):
                 st.session_state.validation_interval_sec = validation_interval
                 st.session_state.validation_duration_min = validation_duration
                 st.session_state.monitoring_active = True
@@ -2628,39 +2951,8 @@ def main():
                 st.session_state.session_log = []
                 st.session_state.validation_active = True
                 st.rerun()
-        
-        with st.expander("Simulation (Advanced)", expanded=False):
-            mc_runs = st.slider("Monte Carlo Runs", 50, 300, 100, 50)
-            jam_probability = st.slider("Jam Event Probability", 0.0, 1.0, 0.3, 0.1, 
-                                        help="Probability of traffic jam in each simulation run")
-            st.session_state.k_mpa_per_ton = st.slider(
-                "Stress proxy k (MPa/ton)",
-                0.1,
-                2.0,
-                float(st.session_state.k_mpa_per_ton),
-                0.1,
-                help="Used to convert load (tons) to a stress proxy."
-            )
-        
-        with st.expander("Vehicle Weights (Advanced)", expanded=False):
-            car_weight = st.number_input("Car", 2000, 6000, 4000, 500)
-            truck_weight = st.number_input("Truck", 15000, 80000, 35000, 5000)
-            bus_weight = st.number_input("Bus", 15000, 40000, 25000, 2500)
-            motorcycle_weight = st.number_input("Motorcycle", 200, 2000, 500, 50)
-        
-        # Update global weights
-        # Update session state weights
-        st.session_state.vehicle_weights['car'] = car_weight
-        st.session_state.vehicle_weights['truck'] = truck_weight
-        st.session_state.vehicle_weights['bus'] = bus_weight
-        st.session_state.vehicle_weights['motorcycle'] = motorcycle_weight
-        
-        st.caption(
-            "⚠️ **Proof-of-Concept**\n\n"
-            "Fatigue scores are proxy metrics. "
-            "Not validated against real sensors."
-        )
-    
+
+    st.caption("*Proof-of-Concept: Fatigue scores are proxy metrics, not validated against real sensors.*")
 
 
     # =========================================================================
@@ -2696,72 +2988,136 @@ def main():
     col_video, col_conditions = st.columns([2, 1])
     
     with col_video:
-        st.subheader("📹 Live Camera Feed")
-        video_placeholder = st.empty()
-        status_placeholder = st.empty()
-        
-        with st.expander("Live feed controls", expanded=False):
-            if st.button("🔄 Refresh Frame"):
-                pass  # Just triggers rerun
-            auto_refresh_live = st.toggle("Auto-refresh live feed", value=True)
-            live_refresh_sec = st.slider("Live refresh (seconds)", 0.5, 5.0, 2.0, 0.5)
-            st.caption(f"Auto-refresh interval: {live_refresh_sec:.1f}s")
-        
-        # Capture frame
-        status_placeholder.info("📡 Connecting to camera...")
-        if st.session_state.monitoring_active and st.session_state.latest_frame_rgb is not None:
-            video_placeholder.image(st.session_state.latest_frame_rgb, width='stretch')
-            ts = st.session_state.latest_frame_time or datetime.now()
-            status_placeholder.success(f"✅ Live (session) | {ts.strftime('%H:%M:%S')}")
-        else:
-            frame = capture_frame(camera_config["url"])
-            
-            if frame is not None:
-                now = datetime.now()
-                vehicle_data, annotated_frame, detections = detect_vehicles(
-                    frame=frame,
-                    model=st.session_state.yolo_model,
-                    camera_config=camera_config,
-                    camera_name=selected_camera,
-                    lane_divider=lane_divider,
-                    confidence=confidence,
-                    bridge_config=bridge_config,
-                    use_roi=st.session_state.get("use_roi", True),
-                    roi_override=st.session_state.get("roi_override", None),
-                    weights=st.session_state.get("vehicle_weights", VEHICLE_WEIGHTS)
-                )
-                k = float(st.session_state.get("k_mpa_per_ton", 0.6))
-                stress_mpa = load_tons_to_stress_mpa(
-                    vehicle_data.get("load_tons", 0.0),
-                    k_mpa_per_ton=k
-                )
-                vehicle_data["stress_mpa_proxy"] = round(stress_mpa, 2)
-                prev_detections = st.session_state.get("prev_detections")
-                prev_time = st.session_state.get("prev_detections_time")
-                if prev_detections is not None and prev_time is not None:
-                    dt_s = (now - prev_time).total_seconds()
-                    avg_speed_mps = estimate_avg_speed_mps(detections, prev_detections, dt_s)
-                    if avg_speed_mps is not None:
-                        vehicle_data["avg_speed_mps"] = round(avg_speed_mps, 2)
-                        vehicle_data["avg_speed_kph"] = round(avg_speed_mps * 3.6, 1)
-                st.session_state.vehicle_data = vehicle_data
-                st.session_state.latest_detections = detections
-                st.session_state.prev_detections = detections
-                st.session_state.prev_detections_time = now
-                
-                frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                video_placeholder.image(frame_rgb, width='stretch')
-                status_placeholder.success(f"✅ Live | {datetime.now().strftime('%H:%M:%S')}")
-            else:
-                video_placeholder.warning("📷 Camera unavailable - using demo mode")
-                # Demo data
-                st.session_state.vehicle_data = {
-                    "approaching": {"car": 5, "truck": 2, "bus": 1, "motorcycle": 0, "total": 8},
-                    "load_tons": 42.5,
-                    "density": 0.034
-                }
+        col_stream, col_live = st.columns(2)
 
- 
+        with col_stream:
+            st.subheader("Live Stream (YouTube)")
+            st.video(camera_config["url"])
+            st.caption("Embedded stream is separate from detection frames.")
+
+        with col_live:
+            st.subheader("Live Camera Feed")
+            video_placeholder = st.empty()
+            status_placeholder = st.empty()
+            
+            with st.expander("Live feed controls", expanded=False):
+                if st.button("Refresh Frame"):
+                    pass  # Just triggers rerun
+                auto_refresh_live = st.toggle("Auto-refresh live feed", value=True)
+                live_refresh_sec = st.slider("Live refresh (seconds)", 0.05, 10.0, 2.0, 0.5)
+                st.caption(f"Auto-refresh interval: {live_refresh_sec:.1f}s")
+                if st.session_state.live_capture_log:
+                    live_csv = pd.DataFrame(st.session_state.live_capture_log).to_csv(index=False)
+                    st.download_button(
+                        "Download Live Feed Log (CSV)",
+                        live_csv,
+                        f"live_feed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        "text/csv",
+                        width='stretch'
+                    )
+            
+            # Capture frame
+            status_placeholder.info("Connecting to camera...")
+            if st.session_state.monitoring_active and st.session_state.latest_frame_rgb is not None:
+                video_placeholder.image(st.session_state.latest_frame_rgb, width='stretch')
+                ts = st.session_state.latest_frame_time or datetime.now()
+                status_placeholder.success(f"Live (session) | {ts.strftime('%H:%M:%S')}")
+            elif st.session_state.monitoring_active and st.session_state.latest_frame_rgb is None:
+                status_placeholder.info("Session running,waiting for first scheduled capture to populate the live frame.")
+            else:
+                frame = capture_frame(camera_config["url"])
+                
+                if frame is not None:
+                    now = datetime.now()
+                    exp_cfg = st.session_state.get("exp_settings", {}) or {}
+                    exp_active = bool(st.session_state.get("experiment_run_active", False))
+                    eff_conf = float(exp_cfg.get("confidence", confidence)) if exp_active else confidence
+                    eff_use_roi = bool(exp_cfg.get("use_roi", st.session_state.get("use_roi", True)))
+                    eff_roi_override = exp_cfg.get("roi", st.session_state.get("roi_override", None))
+                    st.session_state.last_capture_time = now
+                    vehicle_data, annotated_frame, detections = detect_vehicles(
+                        frame=frame,
+                        model=st.session_state.yolo_model,
+                        camera_config=camera_config,
+                        camera_name=selected_camera,
+                        lane_divider=lane_divider,
+                        confidence=eff_conf,
+                        bridge_config=bridge_config,
+                        use_roi=eff_use_roi,
+                        roi_override=eff_roi_override,
+                        weights=st.session_state.get("vehicle_weights", VEHICLE_WEIGHTS),
+                        focal_length_px=st.session_state.get("focal_length_px"),
+                    )
+                    k = float(st.session_state.get("k_mpa_per_ton", 0.6))
+                    stress_mpa = load_tons_to_stress_mpa(
+                        vehicle_data.get("load_tons", 0.0),
+                        k_mpa_per_ton=k
+                    )
+                    vehicle_data["stress_mpa_proxy"] = round(stress_mpa, 2)
+                    prev_detections = st.session_state.get("prev_detections")
+                    prev_time = st.session_state.get("prev_detections_time")
+                    if prev_detections is not None and prev_time is not None:
+                        dt_s = (now - prev_time).total_seconds()
+                        if st.session_state.get("speed_mode") == "pixel":
+                            avg_speed_mps = estimate_avg_speed_mps_pixel(
+                                detections,
+                                prev_detections,
+                                dt_s,
+                                meters_per_pixel=float(st.session_state.get("pixel_m_per_px", 0.05)),
+                                axis=str(st.session_state.get("pixel_axis", "x")),
+                                deadband_px=3.0,
+                                dt_min_s=0.1,
+                                dt_max_s=1.0,
+                            )
+                        else:
+                            avg_speed_mps = estimate_avg_speed_mps(
+                                detections,
+                                prev_detections,
+                                dt_s,
+                                deadband_m=0.5,
+                                dt_min_s=0.1,
+                                dt_max_s=1.0,
+                            )
+                        if avg_speed_mps is not None:
+                            ema_alpha = 0.3
+                            prev_ema = st.session_state.get("speed_ema_mps")
+                            if prev_ema is None:
+                                st.session_state.speed_ema_mps = avg_speed_mps
+                            else:
+                                st.session_state.speed_ema_mps = (
+                                    ema_alpha * avg_speed_mps + (1.0 - ema_alpha) * prev_ema
+                                )
+                            avg_speed_mps = st.session_state.speed_ema_mps
+                        if avg_speed_mps is not None:
+                            vehicle_data["avg_speed_mps"] = round(avg_speed_mps, 2)
+                            vehicle_data["avg_speed_kph"] = round(avg_speed_mps * 3.6, 1)
+                    st.session_state.vehicle_data = vehicle_data
+                    st.session_state.latest_detections = detections
+                    st.session_state.prev_detections = detections
+                    st.session_state.prev_detections_time = now
+                    st.session_state.live_capture_log.append({
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "approaching_total": vehicle_data.get("approaching", {}).get("total", 0),
+                        "leaving_total": vehicle_data.get("leaving", {}).get("total", 0),
+                        "load_tons": vehicle_data.get("load_tons", 0.0),
+                        "density": vehicle_data.get("density", 0.0),
+                        "avg_speed_kph": vehicle_data.get("avg_speed_kph", None),
+                        "stress_mpa_proxy": vehicle_data.get("stress_mpa_proxy", 0.0),
+                    })
+                    if len(st.session_state.live_capture_log) > 500:
+                        st.session_state.live_capture_log = st.session_state.live_capture_log[-500:]
+                    
+                    frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                    video_placeholder.image(frame_rgb, width='stretch')
+                    status_placeholder.success(f"Live | {datetime.now().strftime('%H:%M:%S')}")
+                else:
+                    video_placeholder.warning(" Camera unavailable - using demo mode")
+                    # Demo data
+                    st.session_state.vehicle_data = {
+                        "approaching": {"car": 5, "truck": 2, "bus": 1, "motorcycle": 0, "total": 8},
+                        "load_tons": 42.5,
+                        "density": 0.034
+                    }
 
     with col_conditions:
         st.subheader("📊 Current Conditions")
@@ -2909,7 +3265,7 @@ def main():
     if PLOTLY_AVAILABLE and st.session_state.session_log and len(st.session_state.session_log) >= 2:
         st.markdown("### 📈 Sim vs Observed Shockwave Speed")
         fig_sw = plot_shockwave_sim_vs_obs(st.session_state.session_log)
-        st.plotly_chart(fig_sw, use_container_width=True)
+        st.plotly_chart(fig_sw, width='stretch')
     else:
         st.info("Need at least 2 captures to plot observed shockwave proxy.")
 
@@ -2918,7 +3274,7 @@ def main():
 
     if PLOTLY_AVAILABLE and len(st.session_state.session_log) >= 2:
         fig = build_sim_vs_obs_fig(st.session_state.session_log)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     else:
         st.info("Need at least 2 captures to plot Sim vs Observed trends.")
 
@@ -2929,27 +3285,10 @@ def main():
     st.markdown("---")
     st.subheader("📹 Monitoring Session")
 
-    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1, 1, 2])
+    col_ctrl1, col_ctrl2 = st.columns([2, 1])
 
     with col_ctrl1:
-        if st.button(
-            "▶️ START",
-            type="primary",
-            disabled=st.session_state.monitoring_active or st.session_state.auto_monitoring_enabled or st.session_state.validation_active,
-            width='stretch'
-        ):
-            st.session_state.monitoring_active = True
-            st.session_state.monitoring_start_time = datetime.now()
-            st.session_state.session_log = []
-            st.rerun()
-    
-    with col_ctrl2:
-        if st.button("⏹️ STOP", disabled=not st.session_state.monitoring_active, width='stretch'):
-            st.session_state.monitoring_active = False
-            st.session_state.validation_active = False
-            st.rerun()
-    
-    with col_ctrl3:
+        # Auto-monitoring logic
         if st.session_state.auto_monitoring_enabled:
             if not st.session_state.monitoring_active and not st.session_state.auto_monitoring_started:
                 st.session_state.monitoring_active = True
@@ -2966,15 +3305,19 @@ def main():
                 start_time = datetime.now()
                 st.session_state.monitoring_start_time = start_time
             elapsed = (datetime.now() - start_time).total_seconds()
+            exp_cfg = st.session_state.get("exp_settings", {}) or {}
+            exp_active = bool(st.session_state.get("experiment_run_active", False))
             if st.session_state.validation_active:
                 total_duration = st.session_state.validation_duration_min * 60
+                interval_sec = st.session_state.validation_interval_sec
+            elif exp_active:
+                total_duration = float(exp_cfg.get("duration_min", monitor_duration)) * 60
+                interval_sec = float(exp_cfg.get("interval_sec", capture_interval))
             else:
                 total_duration = monitor_duration * 60
+                interval_sec = capture_interval
             captures_done = len(st.session_state.session_log)
-            if st.session_state.validation_active:
-                expected_captures = int(total_duration / st.session_state.validation_interval_sec)
-            else:
-                expected_captures = int(total_duration / capture_interval)
+            expected_captures = int(total_duration / max(interval_sec, 0.01))
             
             progress = min(elapsed / total_duration, 1.0)
             st.progress(progress, text=f"Capture {captures_done}/{expected_captures} | {int(elapsed)}s / {total_duration}s")
@@ -2984,6 +3327,161 @@ def main():
                 st.session_state.monitoring_active = False
                 st.session_state.validation_active = False
                 st.success("✅ Monitoring session complete!")
+                if st.session_state.get("experiment_run_active", False):
+                    end_ts = datetime.now()
+                    slog = st.session_state.get("session_log", []) or []
+                    captures = len(slog)
+                    avg_load = float(np.mean([float(e.get("vehicle_data", {}).get("load_tons", 0.0) or 0.0) for e in slog])) if captures else 0.0
+                    betas = [e.get("beta_primary") for e in slog if e.get("beta_primary") is not None]
+                    max_beta = float(max(betas)) if betas else None
+                    beta_alerts = sum(1 for b in betas if float(b) < 3.0)
+                    fatigue_vals = [e.get("combined_fatigue") for e in slog if e.get("combined_fatigue") is not None]
+                    fatigue_alerts = sum(1 for f in fatigue_vals if float(f) >= 85.0)
+                    alerts = int(beta_alerts + fatigue_alerts)
+
+                    run_id = int(st.session_state.get("experiment_run_id", 0))
+                    start_ts = st.session_state.get("monitoring_start_time") or end_ts
+                    st.session_state.experiment_runs.append({
+                        "run_id": run_id,
+                        "start": start_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                        "end": end_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                        "captures": captures,
+                        "avg_load_tons": round(avg_load, 2),
+                        "max_beta": round(max_beta, 2) if max_beta is not None else None,
+                        "alerts": alerts
+                    })
+                    st.session_state.experiment_run_active = False
+
+    # Quick capture log (last 50)
+    if st.session_state.session_log:
+        st.markdown("#### 🗂️ Capture log")
+        rows = []
+        for e in st.session_state.session_log[-50:]:
+            vd = e.get("vehicle_data", {}) or {}
+            appr = vd.get("approaching", {}) or {}
+            rows.append({
+                "time": e.get("timestamp"),
+                "vehicles": appr.get("total"),
+                "load_tons": vd.get("load_tons"),
+                "density_veh_per_m": vd.get("density"),
+                "avg_speed_kph": vd.get("avg_speed_kph"),
+                "beta_primary": e.get("beta_primary"),
+                "obs_shockwave": e.get("obs_shockwave"),
+                "sim_shockwave_speed": vd.get("sim_shockwave_speed"),
+            })
+        df_log = pd.DataFrame(rows)
+        st.dataframe(df_log, width='stretch', hide_index=True)
+        st.download_button(
+            "⬇️ Download capture log (CSV)",
+            data=df_log.to_csv(index=False).encode("utf-8"),
+            file_name="capture_log.csv",
+            mime="text/csv",
+        )
+
+    with st.expander("Speed Estimator Validation", expanded=False):
+        if not st.session_state.session_log:
+            st.info("Run a monitoring session to collect speed data.")
+        else:
+            log = st.session_state.session_log
+            idx_max = max(0, len(log) - 1)
+            if idx_max == 0:
+                st.info("Only one frame available; using frame 0.")
+                start_idx, end_idx = 0, 0
+            else:
+                start_idx, end_idx = st.slider(
+                    "Frame range",
+                    0,
+                    idx_max,
+                    (max(0, idx_max - 60), idx_max),
+                )
+            if end_idx <= start_idx:
+                st.warning("Select a valid frame range.")
+            else:
+                window = log[start_idx:end_idx + 1]
+                speeds = [e.get("vehicle_data", {}).get("avg_speed_mps") for e in window]
+                speeds = [s for s in speeds if s is not None]
+                if not speeds:
+                    st.warning("No speed values available in this range.")
+                else:
+                    speeds_arr = np.asarray(speeds, dtype=float)
+                    median_speed = float(np.median(speeds_arr))
+                    spike_rate = float(np.mean(speeds_arr > 15.0)) * 100.0
+                    stop_rate = float(np.mean(speeds_arr > 1.0)) * 100.0
+
+                    col_s1, col_s2, col_s3 = st.columns(3)
+                    with col_s1:
+                        st.metric("Median speed (m/s)", f"{median_speed:.2f}")
+                    with col_s2:
+                        st.metric("Spike rate > 15 m/s", f"{spike_rate:.1f}%")
+                    with col_s3:
+                        st.metric("Stop false-motion > 1 m/s", f"{stop_rate:.1f}%")
+
+                st.markdown("---")
+                st.subheader("Threshold sweep (max_match_dist_px)")
+                sweep_thresholds = [100, 150, 200, 250]
+                sweep_rows = []
+                usable_pairs = 0
+                for i in range(start_idx + 1, end_idx + 1):
+                    cur = log[i]
+                    prev = log[i - 1]
+                    if "detections" not in cur or "detections" not in prev:
+                        continue
+                    dt_s = cur.get("dt_s")
+                    if dt_s is None:
+                        t0 = prev.get("timestamp")
+                        t1 = cur.get("timestamp")
+                        if t0 and t1:
+                            dt_s = (t1 - t0).total_seconds()
+                    if not dt_s or dt_s <= 0:
+                        continue
+                    for thr in sweep_thresholds:
+                        est = estimate_avg_speed_mps(
+                            cur["detections"],
+                            prev["detections"],
+                            dt_s,
+                            max_match_dist_px=float(thr),
+                        )
+                        if est is None:
+                            continue
+                        sweep_rows.append({"threshold_px": thr, "speed_mps": float(est)})
+                    usable_pairs += 1
+
+                if not sweep_rows:
+                    st.info("Enable detection logging to run threshold sweep.")
+                else:
+                    df_sweep = pd.DataFrame(sweep_rows)
+                    out = []
+                    for thr in sweep_thresholds:
+                        vals = df_sweep.loc[df_sweep["threshold_px"] == thr, "speed_mps"].to_numpy()
+                        if vals.size == 0:
+                            continue
+                        out.append({
+                            "threshold_px": thr,
+                            "median_speed_mps": float(np.median(vals)),
+                            "spike_rate_pct": float(np.mean(vals > 15.0)) * 100.0,
+                            "n_pairs": int(vals.size),
+                        })
+                    st.dataframe(pd.DataFrame(out), width='stretch', hide_index=True)
+                    st.caption(f"Usable pairs: {usable_pairs}")
+
+                st.markdown("---")
+                st.subheader("dt_s jitter sensitivity")
+                if start_idx + 1 < end_idx:
+                    dt_vals = []
+                    for i in range(start_idx + 1, end_idx + 1):
+                        cur = log[i]
+                        prev = log[i - 1]
+                        t0 = prev.get("timestamp")
+                        t1 = cur.get("timestamp")
+                        if t0 and t1:
+                            dt_vals.append((t1 - t0).total_seconds())
+                    if dt_vals:
+                        dt_arr = np.asarray(dt_vals, dtype=float)
+                        st.write(
+                            f"dt_s median={np.median(dt_arr):.3f}s, "
+                            f"p10={np.percentile(dt_arr,10):.3f}s, "
+                            f"p90={np.percentile(dt_arr,90):.3f}s"
+                        )
     
     # Monitoring loop
     if st.session_state.monitoring_active:
@@ -2995,6 +3493,10 @@ def main():
         if st.session_state.validation_active:
             total_duration = st.session_state.validation_duration_min * 60
             active_capture_interval = st.session_state.validation_interval_sec
+        elif st.session_state.get("experiment_run_active", False):
+            exp_cfg = st.session_state.get("exp_settings", {}) or {}
+            total_duration = float(exp_cfg.get("duration_min", monitor_duration)) * 60
+            active_capture_interval = float(exp_cfg.get("interval_sec", capture_interval))
         else:
             total_duration = monitor_duration * 60
             active_capture_interval = capture_interval
@@ -3009,16 +3511,24 @@ def main():
                 
                 if frame is not None:
                     now = datetime.now()
+                    st.session_state.last_capture_time = now
+                    exp_cfg = st.session_state.get("exp_settings", {}) or {}
+                    exp_active = bool(st.session_state.get("experiment_run_active", False))
+                    eff_conf = float(exp_cfg.get("confidence", confidence)) if exp_active else confidence
+                    eff_use_roi = bool(exp_cfg.get("use_roi", st.session_state.get("use_roi", True)))
+                    eff_roi_override = exp_cfg.get("roi", st.session_state.get("roi_override", None))
                     vehicle_data, annotated_frame, detections = detect_vehicles(
                                             frame=frame,
                                             model=st.session_state.yolo_model,  
                                             camera_config=camera_config,
                                             camera_name=selected_camera,
                                             lane_divider=lane_divider,
-                                            confidence=confidence,
+                                            confidence=eff_conf,
                                             bridge_config=bridge_config,
-                                            use_roi=st.session_state.get("use_roi", True),
-                                            roi_override=st.session_state.get("roi_override", None)
+                                            use_roi=eff_use_roi,
+                                            roi_override=eff_roi_override,
+                                            weights=st.session_state.get("vehicle_weights", VEHICLE_WEIGHTS),
+                                            focal_length_px=st.session_state.get("focal_length_px"),
                                         )
                     k = float(st.session_state.get("k_mpa_per_ton", 0.6))
                     stress_mpa = load_tons_to_stress_mpa(
@@ -3026,12 +3536,41 @@ def main():
                         k_mpa_per_ton=k
                     )
                     vehicle_data["stress_mpa_proxy"] = round(stress_mpa, 2)
-                    vehicle_data["avg_speed_kph"] = round(avg_speed_mps * 3.6, 1) if avg_speed_mps is not None else None
+                    # avg_speed_kph will be computed after speed estimation (if available)
                     prev_detections = st.session_state.get("prev_detections")
                     prev_time = st.session_state.get("prev_detections_time")
                     if prev_detections is not None and prev_time is not None:
                         dt_s = (now - prev_time).total_seconds()
-                        avg_speed_mps = estimate_avg_speed_mps(detections, prev_detections, dt_s)
+                        if st.session_state.get("speed_mode") == "pixel":
+                            avg_speed_mps = estimate_avg_speed_mps_pixel(
+                                detections,
+                                prev_detections,
+                                dt_s,
+                                meters_per_pixel=float(st.session_state.get("pixel_m_per_px", 0.05)),
+                                axis=str(st.session_state.get("pixel_axis", "x")),
+                                deadband_px=3.0,
+                                dt_min_s=0.1,
+                                dt_max_s=1.0,
+                            )
+                        else:
+                            avg_speed_mps = estimate_avg_speed_mps(
+                                detections,
+                                prev_detections,
+                                dt_s,
+                                deadband_m=0.5,
+                                dt_min_s=0.1,
+                                dt_max_s=1.0,
+                            )
+                        if avg_speed_mps is not None:
+                            ema_alpha = 0.3
+                            prev_ema = st.session_state.get("speed_ema_mps")
+                            if prev_ema is None:
+                                st.session_state.speed_ema_mps = avg_speed_mps
+                            else:
+                                st.session_state.speed_ema_mps = (
+                                    ema_alpha * avg_speed_mps + (1.0 - ema_alpha) * prev_ema
+                                )
+                            avg_speed_mps = st.session_state.speed_ema_mps
                         if avg_speed_mps is not None:
                             vehicle_data["avg_speed_mps"] = round(avg_speed_mps, 2)
                             vehicle_data["avg_speed_kph"] = round(avg_speed_mps * 3.6, 1)
@@ -3082,6 +3621,27 @@ def main():
                         stress_ref_mpa=stress_ref_mpa,
                     )
 
+                    combined_fatigue = None
+                    env_stress_value = None
+                    if exp_active:
+                        use_live_weather = bool(exp_cfg.get("use_live_weather", True))
+                        weather = st.session_state.get("weather")
+                        if use_live_weather or not weather:
+                            weather = fetch_weather(bridge_config.latitude, bridge_config.longitude)
+                            st.session_state.weather = weather
+                        env_breakdown = calculate_environmental_stress(
+                            weather.get("temperature", 10),
+                            weather.get("humidity", 50),
+                            weather.get("precipitation", 0),
+                            weather.get("freeze_thaw_7day", 0),
+                            weather.get("wind_speed", 5),
+                            bridge_config.age_years
+                        )
+                        env_stress_value = env_breakdown.get("combined", None)
+                        traffic_w = float(exp_cfg.get("traffic_weight", 0.70))
+                        env_w = float(exp_cfg.get("environment_weight", 0.30))
+                        combined_fatigue = traffic_w * float(sim_pack["sim"]["fatigue"]) + env_w * float(env_stress_value or 0.0)
+
 
                     # Log entry (store both)
                     frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
@@ -3099,6 +3659,13 @@ def main():
                         **sim_pack,
                         **obs_pack,
                     }
+                    if st.session_state.get("log_detections_for_validation", False):
+                        entry["detections"] = detections
+                        entry["dt_s"] = dt_s
+                    if combined_fatigue is not None:
+                        entry["combined_fatigue"] = round(combined_fatigue, 1)
+                    if env_stress_value is not None:
+                        entry["env_stress"] = round(float(env_stress_value), 1)
 
                     # Compute observed shockwave proxy using previous capture
                     prev_entry = st.session_state.session_log[-2] if len(st.session_state.session_log) >= 2 else None
@@ -3129,8 +3696,14 @@ def main():
                     latest_entry.update(compute_sim_obs_gap(latest_entry))
 
            
-            # Auto-refresh for next capture
-            time.sleep(2)
+            # Auto-refresh for next capture (dynamic; respects the chosen interval).
+            last_cap = st.session_state.get("last_capture_time", None)
+            if last_cap is None:
+                sleep_s = 0.5
+            else:
+                remaining = active_capture_interval - (datetime.now() - last_cap).total_seconds()
+                sleep_s = max(0.1, min(0.5, remaining))
+            time.sleep(sleep_s)
             st.rerun()
     
     with st.expander("Calibration (Advanced)", expanded=False):
@@ -3145,6 +3718,40 @@ def main():
         # Reliability resistance model (proxy)
         mu_R = st.slider("μ_R (MPa)", 100.0, 600.0, 250.0, 10.0)
         sigma_R = st.slider("σ_R (MPa)", 5.0, 150.0, 25.0, 5.0)
+
+        st.markdown("---")
+        st.subheader("Focal Length Calibration (Distance Proxy)")
+        st.caption("Estimate effective focal length using a known distance and observed bbox width.")
+
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            calib_class = st.selectbox("Vehicle class", ["car", "truck", "bus", "motorcycle"], index=0)
+            known_distance_m = st.number_input("Known distance (m)", min_value=1.0, max_value=200.0, value=25.0, step=1.0)
+        with col_f2:
+            use_latest_bbox = st.checkbox("Use latest detection bbox width", value=True)
+            bbox_width_px = st.number_input("BBox width (px)", min_value=1, max_value=2000, value=60, step=1)
+        with col_f3:
+            st.metric("Current f_px", f"{st.session_state.get('focal_length_px') or 'auto'}")
+
+        if use_latest_bbox:
+            latest = st.session_state.get("latest_detections") or []
+            widths = [d.get("bbox_width_px") for d in latest if d.get("type") == calib_class and d.get("bbox_width_px")]
+            if widths:
+                bbox_width_px = int(np.median(widths))
+            else:
+                st.info("No matching detections found for selected class.")
+
+        if st.button("Compute f_px"):
+            if calib_class == "truck" or calib_class == "bus":
+                real_width_m = CAMERA_CALIBRATION["typical_truck_width_m"]
+            elif calib_class == "motorcycle":
+                real_width_m = CAMERA_CALIBRATION["typical_motorcycle_width_m"]
+            else:
+                real_width_m = CAMERA_CALIBRATION["typical_car_width_m"]
+            if bbox_width_px > 0 and known_distance_m > 0:
+                f_px = (known_distance_m * float(bbox_width_px)) / float(real_width_m)
+                st.session_state.focal_length_px = round(f_px, 2)
+                st.success(f"Updated focal length: {st.session_state.focal_length_px} px")
 
     st.session_state.k_mpa_per_ton = k_mpa_per_ton
     st.session_state.stress_ref_mpa = stress_ref_mpa
@@ -3510,18 +4117,54 @@ def main():
             with col_e:
                 st.metric("Environmental", f"{scenario['environmental_stress']:.1f}",
                          delta=f"{scenario['environmental_stress'] - st.session_state.baseline_env_stress:.1f}")
+
+        # Handle experiment runs (single-shot)
+        if st.session_state.get("run_single_experiment"):
+            exp_density = float(st.session_state.get("exp_density", 0.05))
+            exp_vmax_kph = float(st.session_state.get("exp_vmax", 80))
+            exp_jam = bool(st.session_state.get("exp_jam", False))
+
+            sim = run_lwr_simulation(
+                initial_density=exp_density,
+                road_length_m=bridge_config.total_length_m,
+                v_max_mps=exp_vmax_kph / 3.6,
+                inject_jam=exp_jam
+            )
+            sim_pack = compute_simulated_damage_beta(
+                density=exp_density,
+                road_length_m=bridge_config.total_length_m,
+                v_max_mps=exp_vmax_kph / 3.6,
+                inject_jam=exp_jam,
+                miner_m=int(st.session_state.get("miner_m", 3)),
+                miner_C=float(st.session_state.get("miner_C", 1e12)),
+                mu_R=float(st.session_state.get("mu_R", 250.0)),
+                sigma_R=float(st.session_state.get("sigma_R", 25.0)),
+                stress_ref_mpa=float(st.session_state.get("stress_ref_mpa", 80.0)),
+            )
+
+            st.session_state.last_experiment = {"sim": sim, "sim_pack": sim_pack}
+            st.session_state.experiment_log.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "density": exp_density,
+                "v_max": exp_vmax_kph,
+                "jam": exp_jam,
+                "fatigue": sim.get("fatigue"),
+                "beta": sim_pack.get("sim_beta")
+            })
+            st.session_state.run_single_experiment = False
         
         # Charts
         st.markdown("---")
         st.subheader("📈 Analysis Charts")
         
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
             "Fatigue Breakdown", 
             "Sensitivity", 
             "Environmental Factors",
             "📅 Historical Weather",
             "📊 NYSDOT Validation",
-            "📉 Reliability Index"
+            "📉 Reliability Index",
+            "🧪 Experiments"
         ])
         
         with tab1:
@@ -3637,6 +4280,85 @@ def main():
             st.plotly_chart(fig_beta, width='stretch')
             if st.session_state.session_log and len(st.session_state.session_log) >= 2:
                 st.plotly_chart(plot_sim_obs_over_time(st.session_state.session_log), width='stretch')
+
+        with tab7:
+            st.subheader("📊 Monte Carlo Results Summary")
+
+            mc_df = st.session_state.get("mc_data")
+            if mc_df is not None and len(mc_df) > 0:
+                summary = mc_df.describe()[["density", "shockwave_speed", "fatigue"]]
+                st.dataframe(summary, width='stretch')
+
+                percentiles = mc_df[["fatigue"]].quantile([0.1, 0.5, 0.9]).reset_index()
+                percentiles.columns = ["Percentile", "Fatigue"]
+                st.dataframe(percentiles, hide_index=True)
+
+                if PLOTLY_AVAILABLE:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=mc_df["density"],
+                        y=mc_df["fatigue"],
+                        mode="markers",
+                        opacity=0.5,
+                        name="MC runs"
+                    ))
+                    fig.update_layout(
+                        title="Fatigue vs Traffic Density",
+                        xaxis_title="Density (veh/m)",
+                        yaxis_title="Fatigue Score",
+                        template="plotly_white",
+                        height=350
+                    )
+                    st.plotly_chart(fig, width='stretch')
+
+                    fig = go.Figure()
+                    fig.add_histogram(
+                        x=mc_df["fatigue"],
+                        nbinsx=30,
+                        name="Fatigue distribution"
+                    )
+                    fig.add_vline(x=50, line_dash="dash", annotation_text="Safe")
+                    fig.add_vline(x=70, line_dash="dash", annotation_text="Monitor")
+                    fig.add_vline(x=85, line_dash="dash", annotation_text="Critical")
+
+                    fig.update_layout(
+                        title="Fatigue Distribution Across Monte Carlo Runs",
+                        xaxis_title="Fatigue Score",
+                        yaxis_title="Frequency",
+                        template="plotly_white",
+                        height=350
+                    )
+                    st.plotly_chart(fig, width='stretch')
+                else:
+                    st.warning("Plotly not available; install plotly to render charts.")
+            else:
+                st.info("Run baseline analysis to generate Monte Carlo data.")
+
+            st.markdown("---")
+            comparison = pd.DataFrame([
+                {
+                    "Scenario": "Baseline",
+                    "Traffic Fatigue": st.session_state.baseline_traffic_fatigue,
+                    "Environmental Stress": st.session_state.baseline_env_stress,
+                    "Combined": (
+                        0.7 * st.session_state.baseline_traffic_fatigue +
+                        0.3 * st.session_state.baseline_env_stress
+                    )
+                },
+                {
+                    "Scenario": "What-if",
+                    "Traffic Fatigue": scenario["traffic_fatigue"],
+                    "Environmental Stress": scenario["environmental_stress"],
+                    "Combined": scenario["combined_fatigue"]
+                }
+            ])
+            st.dataframe(comparison, width='stretch')
+
+            st.subheader("🧾 Experiment Log")
+            if st.session_state.experiment_log:
+                st.dataframe(pd.DataFrame(st.session_state.experiment_log), width='stretch')
+            else:
+                st.info("No experiments yet. Enable Experiment Mode in the sidebar to run one.")
 
         
 
