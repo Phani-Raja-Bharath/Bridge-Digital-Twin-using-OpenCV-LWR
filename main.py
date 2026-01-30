@@ -958,9 +958,18 @@ def run_lwr_simulation(
 def plot_reliability_over_time(session_log: list) -> go.Figure:
     """Line chart of reliability index β over time"""
     times = [entry["timestamp"].strftime("%H:%M:%S") for entry in session_log]
-    betas = [entry.get("reliability_index", 0.0) for entry in session_log]
+    betas = [
+        round(min(entry.get("reliability_index", 0.0), 5.0), 2) 
+        if entry.get("reliability_index", 0.0) > 0 else None
+        for entry in session_log
+    ]
+
 
     fig = go.Figure()
+    # Filter out None for plotting, mark as gaps
+    if all(b is None for b in betas):
+        betas = [0 for _ in betas]  # fallback to zero line
+
     fig.add_trace(go.Scatter(
         x=times,
         y=betas,
@@ -2302,9 +2311,7 @@ def main():
             st.subheader("🔧 Fatigue + Reliability")
 
             st.metric("Fatigue Damage (Miner)", f"{latest.get('damage', 0.0):.6f}")
-            st.metric("Reliability Index β", f"{latest.get('reliability_index', 0.0):.2f}")
-
-
+            st.metric("Reliability Index β", f"{beta:.2f}" if beta is not None else "—")
     
     # =========================================================================
     # MONITORING SESSION
@@ -2385,8 +2392,11 @@ def main():
                     # Compute fatigue damage using Miner’s Rule
                     damage, mu_S, sigma_S = compute_fatigue_damage(sim["stress_history"])
 
-                    # Compute reliability index β
-                    beta = compute_reliability_index(mu_S=mu_S, sigma_S=sigma_S)
+                    if damage < 1e-6 or (mu_S < 1e-3 and sigma_S < 1e-3):
+                        beta = None  # too low to be meaningful
+                    else:
+                        beta = compute_reliability_index(mu_S=mu_S, sigma_S=sigma_S)
+
 
                     # Include in log
                     frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
