@@ -3,3 +3,7 @@
 /experiments_out
 /bridge_snapshots
 /old unused python files
+# Session logs
+session_logs/
+session_logs/*.jsonl
+session_logs/*_meta.json

@@ -254,6 +254,8 @@ def apply_plotly_theme(fig, height: Optional[int] = None, compact: bool = False)
         return
     axis_size = 16 if compact else PLOTLY_AXIS_FONT_SIZE
     legend_size = 18 if compact else PLOTLY_LEGEND_FONT_SIZE
+    legend_y = -0.5 if compact else -0.35
+    margin_b = 220 if compact else 180
     current_title = ""
     if getattr(fig.layout, "title", None) is not None and getattr(fig.layout.title, "text", None):
         current_title = str(fig.layout.title.text)
@@ -266,7 +268,7 @@ def apply_plotly_theme(fig, height: Optional[int] = None, compact: bool = False)
         ),
         legend=dict(
             orientation="h",
-            y=-0.35,
+            y=legend_y,
             x=0.5,
             xanchor="center",
             font=dict(family=PLOTLY_FONT_FAMILY, size=legend_size, color="#000000"),
@@ -275,7 +277,7 @@ def apply_plotly_theme(fig, height: Optional[int] = None, compact: bool = False)
         uniformtext_mode="hide",
         plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=100, r=60, t=120, b=180),
+        margin=dict(l=100, r=60, t=120, b=margin_b),
         height=PLOTLY_DEFAULT_HEIGHT if height is None else int(height),
     )
     fig.update_xaxes(
@@ -2056,6 +2058,7 @@ def build_sim_vs_obs_fig(session_log: list) -> "go.Figure":
             "Shockwave Speed Gap: (Observed − Simulated)"
         )
     )
+    fig.update_layout(title="Sim vs Observed (Trends)")
 
     # (1) Shockwave speed
     fig.add_trace(go.Scatter(x=df["t"], y=df["sim_shockwave_speed"], mode="lines+markers", name="Sim shockwave speed (m/s)"), row=1, col=1)
@@ -2076,6 +2079,50 @@ def build_sim_vs_obs_fig(session_log: list) -> "go.Figure":
     fig.update_layout(height=650, template="plotly_white", showlegend=True)
     apply_plotly_theme(fig, height=700, compact=True)
     return fig
+
+
+def build_sim_vs_obs_figs(session_log: list) -> Dict[str, "go.Figure"]:
+    """Return separate figures for Sim vs Observed trends."""
+    df = pd.DataFrame(session_log).copy()
+    df["t"] = df["timestamp"]
+    df["sim_shockwave_speed"] = df.get("sim_shockwave_speed", 0.0)
+    df["obs_shockwave_speed"] = df.get("obs_shockwave_speed", 0.0)
+    df["beta_sim"] = df.get("sim_beta", None)
+    df["beta_obs"] = df.get("obs_beta", None)
+    df["beta_primary"] = df.get("beta_primary", None)
+    df["gap_beta"] = df.get("gap_beta", None)
+    df["gap_shockwave_speed"] = df["obs_shockwave_speed"] - df["sim_shockwave_speed"]
+
+    fig_sw = go.Figure()
+    fig_sw.add_trace(go.Scatter(x=df["t"], y=df["sim_shockwave_speed"], mode="lines+markers", name="Sim shockwave (m/s)"))
+    fig_sw.add_trace(go.Scatter(x=df["t"], y=df["obs_shockwave_speed"], mode="lines+markers", name="Obs shockwave (m/s proxy)"))
+    fig_sw.update_layout(title="Shockwave Speed: Sim vs Observed (m/s)", xaxis_title="Time", yaxis_title="Shockwave speed (m/s)")
+    apply_plotly_theme(fig_sw, height=500, compact=True)
+
+    fig_beta = go.Figure()
+    fig_beta.add_trace(go.Scatter(x=df["t"], y=df["beta_sim"], mode="lines+markers", name="β_sim"))
+    fig_beta.add_trace(go.Scatter(x=df["t"], y=df["beta_obs"], mode="lines+markers", name="β_obs"))
+    fig_beta.add_trace(go.Scatter(x=df["t"], y=df["beta_primary"], mode="lines+markers", name="β_primary"))
+    fig_beta.add_hline(y=3.0, line_dash="dash", annotation_text="Target β=3.0")
+    fig_beta.update_layout(title="Reliability β: Sim vs Observed vs Primary", xaxis_title="Time", yaxis_title="β")
+    apply_plotly_theme(fig_beta, height=500, compact=True)
+
+    fig_gap_beta = go.Figure()
+    fig_gap_beta.add_trace(go.Scatter(x=df["t"], y=df["gap_beta"], mode="lines+markers", name="gap_beta"))
+    fig_gap_beta.update_layout(title="β Gap (Observed − Simulated)", xaxis_title="Time", yaxis_title="β gap")
+    apply_plotly_theme(fig_gap_beta, height=500, compact=True)
+
+    fig_gap_sw = go.Figure()
+    fig_gap_sw.add_trace(go.Scatter(x=df["t"], y=df["gap_shockwave_speed"], mode="lines+markers", name="gap_shockwave_speed"))
+    fig_gap_sw.update_layout(title="Shockwave Speed Gap (Observed − Simulated)", xaxis_title="Time", yaxis_title="Shockwave speed gap")
+    apply_plotly_theme(fig_gap_sw, height=500, compact=True)
+
+    return {
+        "shockwave": fig_sw,
+        "beta": fig_beta,
+        "gap_beta": fig_gap_beta,
+        "gap_shockwave": fig_gap_sw,
+    }
 
 
 def create_seasonal_fatigue_chart(seasonal_data: pd.DataFrame) -> go.Figure:
@@ -3002,6 +3049,8 @@ def main():
         st.session_state.experiment_log = []
     if "log_detections_for_validation" not in st.session_state:
         st.session_state.log_detections_for_validation = True
+    if "baseline_running" not in st.session_state:
+        st.session_state.baseline_running = False
     if "save_session_logs" not in st.session_state:
         st.session_state.save_session_logs = False
     if "save_session_include_detections" not in st.session_state:
@@ -3668,8 +3717,14 @@ def main():
     st.subheader("📈 Sim vs Observed (Trends)")
 
     if PLOTLY_AVAILABLE and len(st.session_state.session_log) >= 2:
-        fig = build_sim_vs_obs_fig(st.session_state.session_log)
-        st.plotly_chart(fig, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
+        figs = build_sim_vs_obs_figs(st.session_state.session_log)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.plotly_chart(figs["shockwave"], width='stretch', config=PLOTLY_CONFIG_DEFAULT)
+            st.plotly_chart(figs["gap_beta"], width='stretch', config=PLOTLY_CONFIG_DEFAULT)
+        with col_b:
+            st.plotly_chart(figs["beta"], width='stretch', config=PLOTLY_CONFIG_DEFAULT)
+            st.plotly_chart(figs["gap_shockwave"], width='stretch', config=PLOTLY_CONFIG_DEFAULT)
     else:
         st.info("Need at least 2 captures to plot Sim vs Observed trends.")
 
