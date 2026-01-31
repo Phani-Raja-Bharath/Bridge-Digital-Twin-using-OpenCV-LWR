@@ -194,6 +194,11 @@ def format_vehicle_types_detected(vehicle_data: Dict) -> str:
     parts = [f"{name}:{count}" for name, count in counts.items() if count > 0]
     return ", ".join(parts) if parts else "none"
 
+
+def pause_auto_refresh(seconds: float = 10.0) -> None:
+    """Temporarily pause auto-refresh to keep download links valid."""
+    st.session_state.pause_auto_refresh_until = time.time() + float(seconds)
+
 # =============================================================================
 # 3) WEATHER API (OPEN-METEO)
 # =============================================================================
@@ -3037,6 +3042,7 @@ def main():
                         live_csv,
                         f"live_feed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         "text/csv",
+                        on_click=pause_auto_refresh,
                         width='stretch'
                     )
             
@@ -3283,7 +3289,8 @@ def main():
                 )
 
     # Auto-refresh live feed
-    if auto_refresh_live and not st.session_state.monitoring_active:
+    pause_until = float(st.session_state.get("pause_auto_refresh_until", 0.0) or 0.0)
+    if auto_refresh_live and not st.session_state.monitoring_active and time.time() >= pause_until:
         time.sleep(live_refresh_sec)
         st.rerun()
     
@@ -3402,6 +3409,7 @@ def main():
             data=df_log.to_csv(index=False).encode("utf-8"),
             file_name="capture_log.csv",
             mime="text/csv",
+            on_click=pause_auto_refresh,
         )
 
     with st.expander("Speed Estimator Validation", expanded=False):
@@ -3868,6 +3876,7 @@ def main():
             csv_log,
             f"fatigue_beta_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "text/csv",
+            on_click=pause_auto_refresh,
             width='stretch'
         )
 
@@ -3884,6 +3893,7 @@ def main():
                 session_html,
                 f"session_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
                 "text/html",
+                on_click=pause_auto_refresh,
                 width='stretch'
             )
         
@@ -3917,6 +3927,7 @@ def main():
             csv_hourly,
             f"hourly_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "text/csv",
+            on_click=pause_auto_refresh,
             width='stretch'
         )
 
@@ -4269,6 +4280,7 @@ def main():
                     comparison_html,
                     f"nysdot_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
                     "text/html",
+                    on_click=pause_auto_refresh,
                     width='stretch'
                 )
                 
@@ -4408,6 +4420,7 @@ def main():
                 html_report,
                 f"bridge_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
                 "text/html",
+                on_click=pause_auto_refresh,
                 width='stretch'
             )
         
@@ -4419,6 +4432,7 @@ def main():
                     csv,
                     f"monte_carlo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     "text/csv",
+                    on_click=pause_auto_refresh,
                     width='stretch'
                 )
         
@@ -4460,6 +4474,7 @@ not validated against actual structural monitoring data.
                 summary,
                 f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                 "text/plain",
+                on_click=pause_auto_refresh,
                 width='stretch'
             )
 
