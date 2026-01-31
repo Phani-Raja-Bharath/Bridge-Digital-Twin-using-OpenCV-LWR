@@ -240,11 +240,14 @@ def monte_carlo_bundle(spec: SweepSpec, num_runs: int = 500, live_density: Optio
         live_density=None if live_density is None else float(live_density),
         inject_jam_probability=float(spec.inject_jam_probability),
         rho_max=float(spec.rho_max),
+        seed=int(spec.seed),
     )
     df.insert(0, "experiment", spec.name)
     df.insert(1, "sweep", "monte_carlo")
-    df["road_length_m"] = float(spec.road_length_m)
-    df["rho_max"] = float(spec.rho_max)
+    if "road_length_m" not in df.columns:
+        df["road_length_m"] = float(spec.road_length_m)
+    if "rho_max" not in df.columns:
+        df["rho_max"] = float(spec.rho_max)
     df["inject_jam_probability"] = float(spec.inject_jam_probability)
     return df
 
@@ -300,6 +303,7 @@ def run_live_csv(
     mu_R: float = 250.0,
     sigma_R: float = 25.0,
     sigma_S_ratio: float = 0.10,
+    randomize_constants: bool = True,
 ) -> None:
     end_ts = time.time() + duration_sec
     last_seen = None
@@ -319,10 +323,14 @@ def run_live_csv(
             speed_kph = _safe_float(row.get(speed_col))
         v_max_mps = float(((speed_kph if speed_kph is not None else v_max_kmh_default)) / 3.6)
 
+        rho_max_run = float(np.random.uniform(0.18, 0.22)) if randomize_constants else float(rho_max)
+        road_length_run = float(road_length_m) * (float(np.random.uniform(0.98, 1.02)) if randomize_constants else 1.0)
+        k_mpa_per_ton_run = float(np.random.uniform(0.25, 0.35)) if randomize_constants else float(k_mpa_per_ton)
+
         load_tons = _safe_float(row.get(load_col)) if load_col else None
         stress_mpa_proxy = None
         if load_tons is not None:
-            stress_mpa_proxy = float(load_tons_to_stress_mpa(load_tons, k_mpa_per_ton))
+            stress_mpa_proxy = float(load_tons_to_stress_mpa(load_tons, k_mpa_per_ton_run))
 
         temperature = _safe_float(row.get(env_temp_col)) if env_temp_col else env_temperature
         humidity = _safe_float(row.get(env_humidity_col)) if env_humidity_col else env_humidity
@@ -339,13 +347,15 @@ def run_live_csv(
             bridge_age=int(bridge_age_years),
         )
         env_stress = float(env_breakdown.get("combined", 0.0))
+        if randomize_constants:
+            env_stress = float(np.clip(np.random.normal(env_stress, 2.0), 0.0, 100.0))
 
         sim = run_lwr_simulation(
             initial_density=density,
-            road_length_m=road_length_m,
+            road_length_m=road_length_run,
             v_max_mps=v_max_mps,
             inject_jam=False,
-            rho_max=rho_max,
+            rho_max=rho_max_run,
         )
 
         reliability_beta = None
@@ -370,10 +380,12 @@ def run_live_csv(
             "reliability_beta": reliability_beta,
             "env_stress": env_stress,
             "sim_fatigue": sim.get("fatigue"),
-            "sim_shockwave": sim.get("shockwave_speed"),
+            "sim_shockwave_speed": sim.get("shockwave_speed"),
             "avg_density": sim.get("avg_density"),
             "max_stress": sim.get("max_stress"),
-            "k_mpa_per_ton": k_mpa_per_ton,
+            "k_mpa_per_ton": k_mpa_per_ton_run,
+            "rho_max": rho_max_run,
+            "road_length_m": road_length_run,
             "source": "live_csv",
         }
         _write_row(output_csv, out_row)
@@ -399,6 +411,7 @@ def run_live_camera(
     mu_R: float = 250.0,
     sigma_R: float = 25.0,
     sigma_S_ratio: float = 0.10,
+    randomize_constants: bool = True,
 ) -> None:
     bridge_config = BridgeConfig()
     camera_cfg = CAMERAS[camera_name]
@@ -453,15 +466,18 @@ def run_live_camera(
 
         density = float(vehicle_data.get("density", 0.0) or 0.0)
         load_tons = float(vehicle_data.get("load_tons", 0.0) or 0.0)
-        stress_mpa_proxy = float(load_tons_to_stress_mpa(load_tons, k_mpa_per_ton))
+        rho_max_run = float(np.random.uniform(0.18, 0.22)) if randomize_constants else float(rho_max)
+        road_length_run = float(bridge_config.total_length_m) * (float(np.random.uniform(0.98, 1.02)) if randomize_constants else 1.0)
+        k_mpa_per_ton_run = float(np.random.uniform(0.25, 0.35)) if randomize_constants else float(k_mpa_per_ton)
+        stress_mpa_proxy = float(load_tons_to_stress_mpa(load_tons, k_mpa_per_ton_run))
         v_max_mps = float(((avg_speed_kph if avg_speed_kph is not None else v_max_kmh_default)) / 3.6)
 
         sim = run_lwr_simulation(
             initial_density=density,
-            road_length_m=bridge_config.total_length_m,
+            road_length_m=road_length_run,
             v_max_mps=v_max_mps,
             inject_jam=False,
-            rho_max=rho_max,
+            rho_max=rho_max_run,
         )
 
         env_breakdown = calculate_environmental_stress(
@@ -473,6 +489,8 @@ def run_live_camera(
             bridge_age=bridge_config.age_years,
         )
         env_stress = float(env_breakdown.get("combined", 0.0))
+        if randomize_constants:
+            env_stress = float(np.clip(np.random.normal(env_stress, 2.0), 0.0, 100.0))
 
         sigma_S = max(1e-6, abs(stress_mpa_proxy) * sigma_S_ratio)
         reliability_beta = float(
@@ -493,11 +511,13 @@ def run_live_camera(
             "stress_mpa_proxy": stress_mpa_proxy,
             "reliability_beta": reliability_beta,
             "env_stress": env_stress,
-            "k_mpa_per_ton": k_mpa_per_ton,
+            "k_mpa_per_ton": k_mpa_per_ton_run,
             "sim_fatigue": sim.get("fatigue"),
-            "sim_shockwave": sim.get("shockwave_speed"),
+            "sim_shockwave_speed": sim.get("shockwave_speed"),
             "avg_density": sim.get("avg_density"),
             "max_stress": sim.get("max_stress"),
+            "rho_max": rho_max_run,
+            "road_length_m": road_length_run,
             "source": "live_camera",
         }
         _write_row(output_csv, out_row)
