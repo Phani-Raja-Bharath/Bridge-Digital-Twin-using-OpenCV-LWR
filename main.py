@@ -29,6 +29,43 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
+PLOTLY_FONT_FAMILY = "Times New Roman"
+PLOTLY_FONT_SIZE = 28
+PLOTLY_AXIS_FONT_SIZE = 32
+PLOTLY_TITLE_FONT_SIZE = 48
+PLOTLY_LEGEND_FONT_SIZE = 32
+PLOTLY_DEFAULT_HEIGHT = 900
+
+PLOTLY_CONFIG = {
+    "responsive": True,
+    "displaylogo": False,
+    "displayModeBar": True,
+    "scrollZoom": True,
+    "doubleClick": "reset",
+    "toImageButtonOptions": {
+        "format": "png",
+        "scale": 4,
+        "width": 1920,
+        "height": 1080,
+    },
+    "modeBarButtonsToRemove": [
+        "lasso2d", "select2d",
+        "autoScale2d", "toggleSpikelines"
+    ],
+}
+PLOTLY_CONFIG_CLEAN = {**PLOTLY_CONFIG, "displayModeBar": False}
+PLOTLY_CONFIG_DEFAULT = {**PLOTLY_CONFIG, "displayModeBar": True}
+
+FIG_EXPORT_PRESETS = {
+    "Paper: single-column (3.5in @300dpi)": {"width": 1050, "height": 650, "scale": 3},
+    "Paper: double-column (7.2in @300dpi)": {"width": 2160, "height": 1200, "scale": 3},
+    "Paper: portrait figure (3.5in wide, tall)": {"width": 1050, "height": 1200, "scale": 3},
+    "Presentation (1920x1080)": {"width": 1920, "height": 1080, "scale": 3},
+    "High-res Export (4K)": {"width": 3840, "height": 2160, "scale": 2},
+    "A4 Portrait @300dpi": {"width": 2480, "height": 3508, "scale": 2},
+    "A4 Landscape @300dpi": {"width": 3508, "height": 2480, "scale": 2},
+}
+
 try:
     from ultralytics import YOLO  # type: ignore[attr-defined]
     YOLO_AVAILABLE = True
@@ -210,6 +247,114 @@ def format_vehicle_types_detected(vehicle_data: Dict) -> str:
 def pause_auto_refresh(seconds: float = 10.0) -> None:
     """Temporarily pause auto-refresh to keep download links valid."""
     st.session_state.pause_auto_refresh_until = time.time() + float(seconds)
+
+def apply_plotly_theme(fig, height: Optional[int] = None, compact: bool = False) -> None:
+    """Apply consistent Times New Roman styling to Plotly figures."""
+    if not PLOTLY_AVAILABLE:
+        return
+    axis_size = 16 if compact else PLOTLY_AXIS_FONT_SIZE
+    legend_size = 18 if compact else PLOTLY_LEGEND_FONT_SIZE
+    current_title = ""
+    if getattr(fig.layout, "title", None) is not None and getattr(fig.layout.title, "text", None):
+        current_title = str(fig.layout.title.text)
+    fig.update_layout(
+        template="plotly_white",
+        font=dict(family=PLOTLY_FONT_FAMILY, size=PLOTLY_FONT_SIZE, color="#000000"),
+        title=dict(
+            text=current_title,
+            font=dict(family=PLOTLY_FONT_FAMILY, size=PLOTLY_TITLE_FONT_SIZE, color="#000000"),
+        ),
+        legend=dict(
+            orientation="h",
+            y=-0.35,
+            x=0.5,
+            xanchor="center",
+            font=dict(family=PLOTLY_FONT_FAMILY, size=legend_size, color="#000000"),
+        ),
+        uniformtext_minsize=28,
+        uniformtext_mode="hide",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=dict(l=100, r=60, t=120, b=180),
+        height=PLOTLY_DEFAULT_HEIGHT if height is None else int(height),
+    )
+    fig.update_xaxes(
+        title_font=dict(size=axis_size, family=PLOTLY_FONT_FAMILY, color="#000000"),
+        tickfont=dict(size=axis_size, family=PLOTLY_FONT_FAMILY, color="#000000"),
+        tickangle=-45 if compact else 0,
+        nticks=8 if compact else None,
+        automargin=True,
+    )
+    fig.update_yaxes(
+        title_font=dict(size=axis_size, family=PLOTLY_FONT_FAMILY, color="#000000"),
+        tickfont=dict(size=axis_size, family=PLOTLY_FONT_FAMILY, color="#000000"),
+        automargin=True,
+    )
+
+def init_session_logging(run_type: str) -> None:
+    """Initialize on-disk JSONL logging for a monitoring session."""
+    st.session_state.session_run_type = run_type
+    if not st.session_state.get("save_session_logs", False):
+        st.session_state.session_log_path = None
+        st.session_state.session_meta_path = None
+        st.session_state.session_log_started_at = None
+        return
+
+    out_dir = os.path.join(os.getcwd(), "session_logs")
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = f"session_{ts}"
+    st.session_state.session_log_path = os.path.join(out_dir, f"{base}.jsonl")
+    st.session_state.session_meta_path = os.path.join(out_dir, f"{base}_meta.json")
+    st.session_state.session_log_started_at = datetime.now()
+
+
+def append_session_log_entry(entry: Dict) -> None:
+    """Append one entry to the JSONL log (if enabled)."""
+    path = st.session_state.get("session_log_path")
+    if not path:
+        return
+    include_detections = st.session_state.get("save_session_include_detections", False)
+    payload = dict(entry)
+    payload.pop("image_b64", None)
+    if not include_detections:
+        payload.pop("detections", None)
+    ts = payload.get("timestamp")
+    if isinstance(ts, datetime):
+        payload["timestamp"] = ts.isoformat()
+    def _json_default(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.ndarray,)):
+            return obj.tolist()
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return str(obj)
+    with open(path, "a", encoding="utf-8") as f:
+        json.dump(payload, f, default=_json_default)
+        f.write("\n")
+
+
+def write_session_meta(total_duration_sec: float, interval_sec: float) -> None:
+    """Write a session metadata JSON file (if enabled)."""
+    path = st.session_state.get("session_meta_path")
+    if not path:
+        return
+    start_ts = st.session_state.get("session_log_started_at")
+    end_ts = datetime.now()
+    meta = {
+        "run_type": st.session_state.get("session_run_type"),
+        "started_at": start_ts.isoformat() if isinstance(start_ts, datetime) else None,
+        "ended_at": end_ts.isoformat(),
+        "duration_sec": float(total_duration_sec),
+        "requested_interval_sec": float(interval_sec),
+        "captures": int(len(st.session_state.get("session_log", []) or [])),
+        "save_detections": bool(st.session_state.get("save_session_include_detections", False)),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
 
 # =============================================================================
 # 3) WEATHER API (OPEN-METEO)
@@ -1235,6 +1380,7 @@ def plot_shockwave_sim_vs_obs(session_log: list) -> "go.Figure":
         template="plotly_white",
         height=330,
     )
+    apply_plotly_theme(fig, height=500, compact=True)
     return fig
 
 
@@ -1273,6 +1419,7 @@ def plot_sim_obs_over_time(session_log: list) -> "go.Figure":
         legend=dict(orientation="h")
     )
 
+    apply_plotly_theme(fig, height=500, compact=True)
     return fig
 
 
@@ -1772,7 +1919,7 @@ def create_fatigue_breakdown_chart(traffic: float, environmental: float) -> go.F
         showlegend=True,
         template="plotly_white"
     )
-    
+    apply_plotly_theme(fig, height=450)
     return fig
 
 
@@ -1809,7 +1956,7 @@ def create_sensitivity_chart(base_traffic: float, base_env: float) -> go.Figure:
         yaxis_title="Fatigue Score",
         template="plotly_white"
     )
-    
+    apply_plotly_theme(fig, height=500, compact=True)
     return fig
 
 
@@ -1837,7 +1984,7 @@ def create_environmental_breakdown_chart(env_data: Dict) -> go.Figure:
         title="Environmental Stress Factors",
         template="plotly_white"
     )
-    
+    apply_plotly_theme(fig, height=500)
     return fig
 
 
@@ -1859,6 +2006,7 @@ def create_historical_weather_charts(monthly_data: pd.DataFrame) -> Tuple[go.Fig
         template="plotly_white",
         height=350
     )
+    apply_plotly_theme(fig1, height=550)
     
     # Chart 2: Salt exposure (winter precipitation)
     fig2 = go.Figure()
@@ -1883,7 +2031,7 @@ def create_historical_weather_charts(monthly_data: pd.DataFrame) -> Tuple[go.Fig
         height=350,
         legend=dict(orientation="h", yanchor="bottom", y=1.02)
     )
-    
+    apply_plotly_theme(fig2, height=550)
     return fig1, fig2
 
 def build_sim_vs_obs_fig(session_log: list) -> "go.Figure":
@@ -1926,6 +2074,7 @@ def build_sim_vs_obs_fig(session_log: list) -> "go.Figure":
     fig.add_trace(go.Scatter(x=df["t"], y=df["gap_shockwave_speed"], mode="lines+markers", name="gap_shockwave_speed"), row=2, col=2)
 
     fig.update_layout(height=650, template="plotly_white", showlegend=True)
+    apply_plotly_theme(fig, height=700, compact=True)
     return fig
 
 
@@ -1964,7 +2113,7 @@ def create_seasonal_fatigue_chart(seasonal_data: pd.DataFrame) -> go.Figure:
         template="plotly_white",
         height=350
     )
-    
+    apply_plotly_theme(fig, height=550)
     return fig
 
 def build_observed_stress_history(
@@ -2191,9 +2340,9 @@ def classify_wave_effect(prev_vd: Dict, cur_vd: Dict) -> str:
 def get_report_css() -> str:
     """Return common CSS for HTML reports"""
     return """
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; line-height: 1.6; color: #333; }
-        h1 { color: #2c3e50; margin: 0; }
-        h2 { color: #34495e; margin-top: 30px; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        body { font-family: "Times New Roman", Times, serif; font-size: 11pt; margin: 40px; line-height: 1.6; color: #333; }
+        h1 { color: #2c3e50; margin: 0; font-size: 14pt; }
+        h2 { color: #34495e; margin-top: 30px; border-bottom: 2px solid #3498db; padding-bottom: 10px; font-size: 12pt; }
         .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; }
         .header p { margin: 5px 0; opacity: 0.9; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }
@@ -2201,17 +2350,17 @@ def get_report_css() -> str:
         .card.warning { border-left-color: #f39c12; }
         .card.danger { border-left-color: #e74c3c; }
         .card.success { border-left-color: #27ae60; }
-        .card h3 { margin: 0 0 10px 0; color: #7f8c8d; font-size: 0.9em; text-transform: uppercase; }
-        .card .value { font-size: 2em; font-weight: bold; color: #2c3e50; }
+        .card h3 { margin: 0 0 10px 0; color: #7f8c8d; font-size: 10pt; text-transform: uppercase; }
+        .card .value { font-size: 13pt; font-weight: bold; color: #2c3e50; }
         .score-box { background: linear-gradient(135deg, #74b9ff, #0984e3); color: white; padding: 30px; border-radius: 10px; text-align: center; margin: 30px 0; }
-        .score-box .score { font-size: 4em; font-weight: bold; }
-        .score-box .status { font-size: 1.5em; margin-top: 10px; }
+        .score-box .score { font-size: 16pt; font-weight: bold; }
+        .score-box .status { font-size: 11pt; margin-top: 10px; }
         table { width: 100%; border-collapse: collapse; margin: 20px 0; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; font-size: 10pt; }
         th { background: #f8f9fa; }
         .limitations { background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 20px; margin-top: 30px; }
         .limitations h3 { color: #856404; margin-top: 0; }
-        .footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; color: #7f8c8d; font-size: 0.9em; text-align: center; }
+        .footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; color: #7f8c8d; font-size: 10pt; text-align: center; }
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin: 20px 0; }
         .stat-card { background: #f8f9fa; border-radius: 8px; padding: 20px; text-align: center; }
         .stat-card .value { font-size: 2em; font-weight: bold; color: #2c3e50; }
@@ -2853,6 +3002,18 @@ def main():
         st.session_state.experiment_log = []
     if "log_detections_for_validation" not in st.session_state:
         st.session_state.log_detections_for_validation = True
+    if "save_session_logs" not in st.session_state:
+        st.session_state.save_session_logs = False
+    if "save_session_include_detections" not in st.session_state:
+        st.session_state.save_session_include_detections = False
+    if "session_log_path" not in st.session_state:
+        st.session_state.session_log_path = None
+    if "session_meta_path" not in st.session_state:
+        st.session_state.session_meta_path = None
+    if "session_log_started_at" not in st.session_state:
+        st.session_state.session_log_started_at = None
+    if "session_run_type" not in st.session_state:
+        st.session_state.session_run_type = None
     
     if "yolo_model" not in st.session_state:
         with st.spinner("Loading YOLO model..."):
@@ -2896,6 +3057,7 @@ def main():
             st.session_state.monitoring_active = True
             st.session_state.monitoring_start_time = datetime.now()
             st.session_state.session_log = []
+            init_session_logging("monitoring")
             st.rerun()
         if stop_btn:
             st.session_state.monitoring_active = False
@@ -2927,6 +3089,23 @@ def main():
             help="Automatically run a monitoring session"
         )
         st.session_state.auto_monitoring_enabled = auto_monitoring_enabled
+
+    col_save1, col_save2 = st.columns(2)
+    with col_save1:
+        st.checkbox(
+            "Save session log to disk (JSONL)",
+            value=st.session_state.save_session_logs,
+            key="save_session_logs",
+            help="Writes JSONL to ./session_logs for each session"
+        )
+    with col_save2:
+        st.checkbox(
+            "Include detections in saved log",
+            value=st.session_state.save_session_include_detections,
+            key="save_session_include_detections",
+            disabled=not st.session_state.save_session_logs,
+            help="Large files; includes per-detection details"
+        )
 
     # =========================================================================
     # STAGE 2: DETECTION SETTINGS
@@ -3078,6 +3257,7 @@ def main():
                     st.session_state.monitoring_active = True
                     st.session_state.monitoring_start_time = datetime.now()
                     st.session_state.session_log = []
+                    init_session_logging("experiment")
                     st.session_state.auto_monitoring_enabled = False
                     st.session_state.validation_active = False
                     st.rerun()
@@ -3138,6 +3318,7 @@ def main():
                 st.session_state.monitoring_start_time = datetime.now()
                 st.session_state.session_log = []
                 st.session_state.validation_active = True
+                init_session_logging("validation")
                 st.rerun()
 
     st.caption("*Proof-of-Concept: Fatigue scores are proxy metrics, not validated against real sensors.*")
@@ -3479,7 +3660,7 @@ def main():
     if PLOTLY_AVAILABLE and st.session_state.session_log and len(st.session_state.session_log) >= 2:
         st.markdown("### 📈 Sim vs Observed Shockwave Speed")
         fig_sw = plot_shockwave_sim_vs_obs(st.session_state.session_log)
-        st.plotly_chart(fig_sw, width='stretch')
+        st.plotly_chart(fig_sw, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
     else:
         st.info("Need at least 2 captures to plot observed shockwave proxy.")
 
@@ -3488,7 +3669,7 @@ def main():
 
     if PLOTLY_AVAILABLE and len(st.session_state.session_log) >= 2:
         fig = build_sim_vs_obs_fig(st.session_state.session_log)
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
     else:
         st.info("Need at least 2 captures to plot Sim vs Observed trends.")
 
@@ -3508,6 +3689,7 @@ def main():
                 st.session_state.monitoring_active = True
                 st.session_state.monitoring_start_time = datetime.now()
                 st.session_state.session_log = []
+                init_session_logging("auto")
                 st.session_state.auto_monitoring_started = True
                 st.rerun()
         else:
@@ -3553,6 +3735,7 @@ def main():
             if elapsed >= total_duration:
                 st.session_state.monitoring_active = False
                 st.session_state.validation_active = False
+                write_session_meta(total_duration, interval_sec)
                 st.success("✅ Monitoring session complete!")
                 if st.session_state.get("experiment_run_active", False):
                     end_ts = datetime.now()
@@ -3979,6 +4162,7 @@ def main():
                     entry["wave_label"] = f"{frame_direction}_{wave_effect}"
 
 
+                    append_session_log_entry(entry)
                     st.session_state.session_log.append(entry)
 
                     # Add events + gaps
@@ -4490,15 +4674,15 @@ def main():
         
         with tab1:
             fig = create_fatigue_breakdown_chart(scenario["traffic_fatigue"], scenario["environmental_stress"])
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
         
         with tab2:
             fig = create_sensitivity_chart(st.session_state.baseline_traffic_fatigue, scenario["environmental_stress"])
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
         
         with tab3:
             fig = create_environmental_breakdown_chart(scenario["env_breakdown"])
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
         
         with tab4:
             st.markdown("### 📅 Historical Weather Analysis (Last 12 Months)")
@@ -4531,12 +4715,12 @@ def main():
                 # Charts
                 if "monthly_data" in analysis and len(analysis["monthly_data"]) > 0:
                     fig1, fig2 = create_historical_weather_charts(analysis["monthly_data"])
-                    st.plotly_chart(fig1, width='stretch')
-                    st.plotly_chart(fig2, width='stretch')
+                    st.plotly_chart(fig1, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
+                    st.plotly_chart(fig2, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
                 
                 if "seasonal_data" in analysis:
                     fig3 = create_seasonal_fatigue_chart(analysis["seasonal_data"])
-                    st.plotly_chart(fig3, width='stretch')
+                st.plotly_chart(fig3, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
                 
                 # Key finding for paper
                 st.info(
@@ -4599,9 +4783,9 @@ def main():
         with tab6:
             st.subheader("📉 Reliability Index Over Time")
             fig_beta = plot_reliability_over_time(st.session_state.session_log)
-            st.plotly_chart(fig_beta, width='stretch')
+            st.plotly_chart(fig_beta, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
             if st.session_state.session_log and len(st.session_state.session_log) >= 2:
-                st.plotly_chart(plot_sim_obs_over_time(st.session_state.session_log), width='stretch')
+                st.plotly_chart(plot_sim_obs_over_time(st.session_state.session_log), width='stretch', config=PLOTLY_CONFIG_DEFAULT)
 
         with tab7:
             st.subheader("📊 Monte Carlo Results Summary")
@@ -4631,7 +4815,8 @@ def main():
                         template="plotly_white",
                         height=350
                     )
-                    st.plotly_chart(fig, width='stretch')
+                    apply_plotly_theme(fig, height=550)
+                    st.plotly_chart(fig, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
 
                     fig = go.Figure()
                     fig.add_histogram(
@@ -4650,7 +4835,8 @@ def main():
                         template="plotly_white",
                         height=350
                     )
-                    st.plotly_chart(fig, width='stretch')
+                    apply_plotly_theme(fig, height=550)
+                    st.plotly_chart(fig, width='stretch', config=PLOTLY_CONFIG_DEFAULT)
                 else:
                     st.warning("Plotly not available; install plotly to render charts.")
             else:

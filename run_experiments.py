@@ -539,7 +539,12 @@ def try_plotly():
 
 def save_plotly_fig(fig, outpath: Path) -> None:
     outpath.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(str(outpath), include_plotlyjs="cdn")
+    try:
+        fig.write_image(str(outpath), width=1920, height=1080, scale=4)
+    except Exception as exc:
+        html_path = outpath.with_suffix(".html")
+        fig.write_html(str(html_path), include_plotlyjs="cdn")
+        print(f"[warn] PNG export failed ({exc}); wrote HTML instead: {html_path}")
 
 
 def make_figs(df: pd.DataFrame, outdir: Path) -> List[Path]:
@@ -553,50 +558,151 @@ def make_figs(df: pd.DataFrame, outdir: Path) -> List[Path]:
     import plotly.express as px
     import plotly.graph_objects as go
 
+    line_colors = ["#1b9e77", "#d95f02", "#7570b3", "#e7298a"]
+    discrete_colors = ["#1b9e77", "#d95f02", "#7570b3", "#66a61e", "#e6ab02"]
+    heatmap_scale = "Viridis"
+    template = "plotly_white"
+    base_font = dict(size=28, family="Times New Roman", color="#000000")
+    axis_font = dict(size=32, family="Times New Roman", color="#000000")
+    title_font = dict(size=48, family="Times New Roman", color="#000000")
+    legend_font = dict(size=32, family="Times New Roman", color="#000000")
+
     figs: List[Path] = []
 
     # 1) Density sweep line charts
     d = df[df["sweep"].eq("density")].copy()
     if len(d):
-        fig = px.line(d, x="density", y="fatigue_mean", markers=True, title="Fatigue vs Density (mean)")
-        p = outdir / "figs" / "fatigue_vs_density.html"
+        fig = px.line(
+            d, x="density", y="fatigue_mean", markers=True,
+            title="Fatigue vs Density (mean)",
+            color_discrete_sequence=discrete_colors,
+        )
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "fatigue_vs_density.png"
         save_plotly_fig(fig, p); figs.append(p)
 
-        fig = px.line(d, x="density", y="shockwave_mean", markers=True, title="Shockwave speed vs Density (mean)")
-        p = outdir / "figs" / "shockwave_vs_density.html"
+        fig = px.line(
+            d, x="density", y="shockwave_mean", markers=True,
+            title="Shockwave speed vs Density (mean)",
+            color_discrete_sequence=discrete_colors,
+        )
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "shockwave_vs_density.png"
         save_plotly_fig(fig, p); figs.append(p)
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=d["density"], y=d["fatigue_p90"], mode="lines", name="p90", line=dict(width=0)))
-        fig.add_trace(go.Scatter(x=d["density"], y=d["fatigue_p50"], mode="lines", name="p50"))
+        fig.add_trace(go.Scatter(x=d["density"], y=d["fatigue_p50"], mode="lines", name="p50", line=dict(color=line_colors[0])))
         fig.add_trace(go.Scatter(
             x=d["density"], y=d["fatigue_p90"], mode="lines",
-            fill="tonexty", line=dict(width=0), name="p90 band", showlegend=False
+            fill="tonexty", line=dict(width=0), name="p90 band", showlegend=False, fillcolor="rgba(27,158,119,0.2)"
         ))
-        fig.update_layout(title="Fatigue vs Density (p50/p90 band)", xaxis_title="density", yaxis_title="fatigue")
-        p = outdir / "figs" / "fatigue_vs_density_bands.html"
+        fig.update_layout(
+            title="Fatigue vs Density (p50/p90 band)",
+            xaxis_title="density",
+            yaxis_title="fatigue",
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "fatigue_vs_density_bands.png"
         save_plotly_fig(fig, p); figs.append(p)
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=d["density"], y=d["shockwave_p90"], mode="lines", name="p90", line=dict(width=0)))
-        fig.add_trace(go.Scatter(x=d["density"], y=d["shockwave_p50"], mode="lines", name="p50"))
+        fig.add_trace(go.Scatter(x=d["density"], y=d["shockwave_p50"], mode="lines", name="p50", line=dict(color=line_colors[1])))
         fig.add_trace(go.Scatter(
             x=d["density"], y=d["shockwave_p90"], mode="lines",
-            fill="tonexty", line=dict(width=0), name="p90 band", showlegend=False
+            fill="tonexty", line=dict(width=0), name="p90 band", showlegend=False, fillcolor="rgba(217,95,2,0.2)"
         ))
-        fig.update_layout(title="Shockwave vs Density (p50/p90 band)", xaxis_title="density", yaxis_title="shockwave")
-        p = outdir / "figs" / "shockwave_vs_density_bands.html"
+        fig.update_layout(
+            title="Shockwave vs Density (p50/p90 band)",
+            xaxis_title="density",
+            yaxis_title="shockwave",
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "shockwave_vs_density_bands.png"
         save_plotly_fig(fig, p); figs.append(p)
 
     # 2) v_max sweep
     v = df[df["sweep"].eq("v_max")].copy()
     if len(v):
-        fig = px.line(v, x="v_max_kmh", y="fatigue_mean", markers=True, title="Fatigue vs v_max (mean)")
-        p = outdir / "figs" / "fatigue_vs_vmax.html"
+        fig = px.line(
+            v, x="v_max_kmh", y="fatigue_mean", markers=True,
+            title="Fatigue vs v_max (mean)",
+            color_discrete_sequence=discrete_colors,
+        )
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "fatigue_vs_vmax.png"
         save_plotly_fig(fig, p); figs.append(p)
 
-        fig = px.line(v, x="v_max_kmh", y="shockwave_mean", markers=True, title="Shockwave speed vs v_max (mean)")
-        p = outdir / "figs" / "shockwave_vs_vmax.html"
+        fig = px.line(
+            v, x="v_max_kmh", y="shockwave_mean", markers=True,
+            title="Shockwave speed vs v_max (mean)",
+            color_discrete_sequence=discrete_colors,
+        )
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "shockwave_vs_vmax.png"
         save_plotly_fig(fig, p); figs.append(p)
 
         fig = go.Figure()
@@ -606,8 +712,22 @@ def make_figs(df: pd.DataFrame, outdir: Path) -> List[Path]:
             x=v["v_max_kmh"], y=v["fatigue_p90"], mode="lines",
             fill="tonexty", line=dict(width=0), name="p90 band", showlegend=False
         ))
-        fig.update_layout(title="Fatigue vs v_max (p50/p90 band)", xaxis_title="v_max_kmh", yaxis_title="fatigue")
-        p = outdir / "figs" / "fatigue_vs_vmax_bands.html"
+        fig.update_layout(
+            title="Fatigue vs v_max (p50/p90 band)",
+            xaxis_title="v_max_kmh",
+            yaxis_title="fatigue",
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "fatigue_vs_vmax_bands.png"
         save_plotly_fig(fig, p); figs.append(p)
 
         fig = go.Figure()
@@ -617,19 +737,65 @@ def make_figs(df: pd.DataFrame, outdir: Path) -> List[Path]:
             x=v["v_max_kmh"], y=v["shockwave_p90"], mode="lines",
             fill="tonexty", line=dict(width=0), name="p90 band", showlegend=False
         ))
-        fig.update_layout(title="Shockwave vs v_max (p50/p90 band)", xaxis_title="v_max_kmh", yaxis_title="shockwave")
-        p = outdir / "figs" / "shockwave_vs_vmax_bands.html"
+        fig.update_layout(
+            title="Shockwave vs v_max (p50/p90 band)",
+            xaxis_title="v_max_kmh",
+            yaxis_title="shockwave",
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "shockwave_vs_vmax_bands.png"
         save_plotly_fig(fig, p); figs.append(p)
 
     # 3) Jam probability sweep
     j = df[df["sweep"].eq("jam_probability")].copy()
     if len(j):
-        fig = px.line(j, x="inject_jam_probability", y="fatigue_mean", markers=True, title="Fatigue vs Jam Probability (mean)")
-        p = outdir / "figs" / "fatigue_vs_jamprob.html"
+        fig = px.line(
+            j, x="inject_jam_probability", y="fatigue_mean", markers=True,
+            title="Fatigue vs Jam Probability (mean)",
+            color_discrete_sequence=discrete_colors,
+        )
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "fatigue_vs_jamprob.png"
         save_plotly_fig(fig, p); figs.append(p)
 
-        fig = px.line(j, x="inject_jam_probability", y="jam_rate", markers=True, title="Jam Rate vs Jam Probability")
-        p = outdir / "figs" / "jamrate_vs_jamprob.html"
+        fig = px.line(
+            j, x="inject_jam_probability", y="jam_rate", markers=True,
+            title="Jam Rate vs Jam Probability",
+            color_discrete_sequence=discrete_colors,
+        )
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "jamrate_vs_jamprob.png"
         save_plotly_fig(fig, p); figs.append(p)
 
     # 4) Grid heatmap (fatigue_mean)
@@ -643,8 +809,21 @@ def make_figs(df: pd.DataFrame, outdir: Path) -> List[Path]:
             labels={"x": "v_max_kmh", "y": "density", "color": "fatigue_mean"},
             title="Fatigue Mean Heatmap (density x v_max)",
             aspect="auto",
+            color_continuous_scale=heatmap_scale,
         )
-        p = outdir / "figs" / "fatigue_heatmap_density_vmax.html"
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "fatigue_heatmap_density_vmax.png"
         save_plotly_fig(fig, p); figs.append(p)
 
         pivot = g.pivot(index="density", columns="v_max_kmh", values="shockwave_mean")
@@ -655,8 +834,21 @@ def make_figs(df: pd.DataFrame, outdir: Path) -> List[Path]:
             labels={"x": "v_max_kmh", "y": "density", "color": "shockwave_mean"},
             title="Shockwave Mean Heatmap (density x v_max)",
             aspect="auto",
+            color_continuous_scale=heatmap_scale,
         )
-        p = outdir / "figs" / "shockwave_heatmap_density_vmax.html"
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "shockwave_heatmap_density_vmax.png"
         save_plotly_fig(fig, p); figs.append(p)
 
         pivot = g.pivot(index="density", columns="v_max_kmh", values="fatigue_p90")
@@ -667,34 +859,120 @@ def make_figs(df: pd.DataFrame, outdir: Path) -> List[Path]:
             labels={"x": "v_max_kmh", "y": "density", "color": "fatigue_p90"},
             title="Fatigue P90 Heatmap (density x v_max)",
             aspect="auto",
+            color_continuous_scale=heatmap_scale,
         )
-        p = outdir / "figs" / "fatigue_p90_heatmap_density_vmax.html"
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "fatigue_p90_heatmap_density_vmax.png"
         save_plotly_fig(fig, p); figs.append(p)
 
     # 5) Monte Carlo distributions
     mc = df[df["sweep"].eq("monte_carlo")].copy()
     if len(mc):
         fig = px.histogram(mc, x="fatigue", nbins=40, title="Monte Carlo Fatigue Distribution")
-        p = outdir / "figs" / "mc_fatigue_hist.html"
+        fig.update_traces(marker_color=discrete_colors[0])
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "mc_fatigue_hist.png"
         save_plotly_fig(fig, p); figs.append(p)
 
-        fig = px.scatter(mc, x="density", y="fatigue", color="jam_injected", title="MC Scatter: Fatigue vs Density")
-        p = outdir / "figs" / "mc_scatter_fatigue_density.html"
+        fig = px.scatter(
+            mc, x="density", y="fatigue", color="jam_injected",
+            title="MC Scatter: Fatigue vs Density",
+            color_discrete_sequence=discrete_colors,
+        )
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            legend=dict(orientation="h", y=-0.35, x=0.5, xanchor="center"),
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "mc_scatter_fatigue_density.png"
         save_plotly_fig(fig, p); figs.append(p)
 
-        fig = px.scatter(mc, x="v_max", y="fatigue", color="jam_injected", title="MC Scatter: Fatigue vs v_max")
-        p = outdir / "figs" / "mc_scatter_fatigue_vmax.html"
+        fig = px.scatter(
+            mc, x="v_max", y="fatigue", color="jam_injected",
+            title="MC Scatter: Fatigue vs v_max",
+            color_discrete_sequence=discrete_colors,
+        )
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            legend=dict(orientation="h", y=-0.35, x=0.5, xanchor="center"),
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "mc_scatter_fatigue_vmax.png"
         save_plotly_fig(fig, p); figs.append(p)
 
         fig = px.histogram(mc, x="shockwave_speed", nbins=40, title="Monte Carlo Shockwave Distribution")
-        p = outdir / "figs" / "mc_shockwave_hist.html"
+        fig.update_traces(marker_color=discrete_colors[1])
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "mc_shockwave_hist.png"
         save_plotly_fig(fig, p); figs.append(p)
 
         fig = px.density_heatmap(
             mc, x="density", y="shockwave_speed",
-            nbinsx=30, nbinsy=30, title="MC Density vs Shockwave (density heatmap)"
+            nbinsx=30, nbinsy=30, title="MC Density vs Shockwave (density heatmap)",
+            color_continuous_scale=heatmap_scale,
         )
-        p = outdir / "figs" / "mc_density_shockwave_heatmap.html"
+        fig.update_layout(
+            template=template,
+            font=base_font,
+            title_font=title_font,
+            legend_font=legend_font,
+            height=900,
+            margin=dict(l=100, r=60, t=120, b=180),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig.update_xaxes(title_font=axis_font, tickfont=axis_font)
+        fig.update_yaxes(title_font=axis_font, tickfont=axis_font)
+        p = outdir / "figs" / "mc_density_shockwave_heatmap.png"
         save_plotly_fig(fig, p); figs.append(p)
 
     return figs
@@ -860,4 +1138,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
