@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, cast
 import time
 import subprocess
 from PIL import Image
@@ -1065,6 +1065,17 @@ def load_tons_to_stress_mpa(load_tons: float, k_mpa_per_ton: float = 0.6) -> flo
     """
     return float(max(0.0, load_tons) * k_mpa_per_ton)
 
+
+def integrate_trapz(values: list, dx: float) -> float:
+    """Numerical integration with safe numpy fallback for older versions."""
+    func = getattr(np, "trapezoid", None)
+    if callable(func):
+        result = func(np.asarray(values, dtype=float), dx=dx)
+        return cast(float, result)
+    if not values:
+        return 0.0
+    return float(sum((values[i] + values[i - 1]) * 0.5 * dx for i in range(1, len(values))))
+
 # =============================================================================
 # 5) SIMULATION + ML
 # =============================================================================
@@ -1120,7 +1131,7 @@ def run_lwr_simulation(
         stress = float(np.mean(rho) / rho_max * 100.0)
         stress_history.append(stress)
 
-    cumulative = float(np.trapezoid(stress_history, dx=dt))
+    cumulative = integrate_trapz(stress_history, dx=dt)
     fatigue = float(np.clip(cumulative / 100.0, 0.0, 100.0))
 
     shockwave_speed = float(np.mean(np.abs(np.gradient(rho))) * v_max_mps)
@@ -2987,9 +2998,6 @@ def main():
     # =========================================================================
     # LOAD MODELS
     # =========================================================================
-    if "yolo_model" not in st.session_state:
-        with st.spinner("Loading YOLO model..."):
-            st.session_state.yolo_model = YOLO("yolov8n.pt")
     
     if "baseline_calculated" not in st.session_state:
         st.session_state.baseline_calculated = False
@@ -3033,7 +3041,7 @@ def main():
                 if st.button("Refresh Frame"):
                     pass  # Just triggers rerun
                 auto_refresh_live = st.toggle("Auto-refresh live feed", value=True)
-                live_refresh_sec = st.slider("Live refresh (seconds)", 0.05, 10.0, 2.0, 0.5)
+                live_refresh_sec = st.slider("Live refresh (seconds)", 0.05, 10.0, 0.25, 0.5)
                 st.caption(f"Auto-refresh interval: {live_refresh_sec:.1f}s")
                 if st.session_state.live_capture_log:
                     live_csv = pd.DataFrame(st.session_state.live_capture_log).to_csv(index=False)
@@ -4033,13 +4041,15 @@ def main():
         if st.session_state.rf_metrics:
             metrics = st.session_state.rf_metrics
             with st.expander("🔍 DEBUG: Model Training Details", expanded=True):
-                col_d1, col_d2, col_d3 = st.columns(3)
+                col_d1, col_d2, col_d3, col_d4 = st.columns(4)
                 with col_d1:
                     st.metric("Training Samples", metrics.get("samples", "N/A"))
                 with col_d2:
                     st.metric("CV R² (mean)", f"{metrics.get('cv_r2_mean', 0):.3f}")
                 with col_d3:
                     st.metric("CV MAE (mean)", f"{metrics.get('cv_mae_mean', 0):.2f}")
+                with col_d4:
+                    st.metric("CV RMSE (mean)", f"{metrics.get('cv_rmse_mean', 0):.2f}")
                     
                 
                 st.markdown("**Features Used:**")
