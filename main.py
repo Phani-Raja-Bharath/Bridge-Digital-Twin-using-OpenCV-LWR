@@ -2097,7 +2097,7 @@ def build_sim_vs_obs_figs(session_log: list) -> Dict[str, "go.Figure"]:
     fig_sw.add_trace(go.Scatter(x=df["t"], y=df["sim_shockwave_speed"], mode="lines+markers", name="Sim shockwave (m/s)"))
     fig_sw.add_trace(go.Scatter(x=df["t"], y=df["obs_shockwave_speed"], mode="lines+markers", name="Obs shockwave (m/s proxy)"))
     fig_sw.update_layout(title="Shockwave Speed: Sim vs Observed (m/s)", xaxis_title="Time", yaxis_title="Shockwave speed (m/s)")
-    apply_plotly_theme(fig_sw, height=500, compact=True)
+    apply_plotly_theme(fig_sw, height=800, compact=True)
 
     fig_beta = go.Figure()
     fig_beta.add_trace(go.Scatter(x=df["t"], y=df["beta_sim"], mode="lines+markers", name="β_sim"))
@@ -2105,7 +2105,7 @@ def build_sim_vs_obs_figs(session_log: list) -> Dict[str, "go.Figure"]:
     fig_beta.add_trace(go.Scatter(x=df["t"], y=df["beta_primary"], mode="lines+markers", name="β_primary"))
     fig_beta.add_hline(y=3.0, line_dash="dash", annotation_text="Target β=3.0")
     fig_beta.update_layout(title="Reliability β: Sim vs Observed vs Primary", xaxis_title="Time", yaxis_title="β")
-    apply_plotly_theme(fig_beta, height=500, compact=True)
+    apply_plotly_theme(fig_beta, height=800, compact=True)
 
     fig_gap_beta = go.Figure()
     fig_gap_beta.add_trace(go.Scatter(x=df["t"], y=df["gap_beta"], mode="lines+markers", name="gap_beta"))
