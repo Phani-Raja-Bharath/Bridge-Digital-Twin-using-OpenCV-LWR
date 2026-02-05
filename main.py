@@ -1,3 +1,7 @@
+if "session_log" not in st.session_state:
+    st.session_state.session_log = []
+
+
 import streamlit as st
 import cv2
 import numpy as np
@@ -3628,7 +3632,7 @@ def main():
                     )
 
         # show damage + reliability if available
-        if st.session_state.session_log:
+        if st.session_state.get("session_log"):
             latest = st.session_state.session_log[-1]
 
             st.markdown("---")
@@ -3654,7 +3658,7 @@ def main():
             for r in conf["reasons"]:
                 st.write(f"- {r}")
 
-            if st.session_state.session_log:
+            if st.session_state.get("session_log"):
                 ev = st.session_state.session_log[-1].get("events", [])
                 if ev:
                     st.write("Events:")
@@ -3662,7 +3666,7 @@ def main():
                 else:
                     st.write("Events: None")
 
-        if st.session_state.session_log:
+        if st.session_state.get("session_log"):
             latest = st.session_state.session_log[-1]
             latest_beta = latest.get("beta_primary", None)
             st.metric("Reliability β (Primary)", f"{latest_beta:.2f}" if latest_beta is not None else "—")
@@ -3818,7 +3822,7 @@ def main():
                     st.session_state.experiment_run_active = False
 
     # Quick capture log (last 50)
-    if st.session_state.session_log:
+    if st.session_state.get("session_log"):
         st.markdown("#### 🗂️ Capture log")
         rows = []
         for e in st.session_state.session_log[-50:]:
@@ -4295,7 +4299,7 @@ def main():
     st.session_state.sigma_R = sigma_R
 
     # Show session log
-    if st.session_state.session_log:
+    if st.session_state.get("session_log"):
         st.markdown("**Session Log:**")
         
         log_df = pd.DataFrame([
@@ -4386,7 +4390,7 @@ def main():
 
 
         ])
-        if st.session_state.session_log:
+        if st.session_state.get("session_log"):
             st.session_state.latest_beta = st.session_state.session_log[-1].get("beta_primary")
         csv_log = df_log.to_csv(index=False)
 
@@ -4790,7 +4794,7 @@ def main():
             st.markdown("### 📊 NYSDOT Traffic Count Validation")
             st.markdown("*Compare your detection results with official NYSDOT data*")
             
-            if st.session_state.session_log:
+            if st.session_state.get("session_log"):
                 st.success(f"✅ Session data available: {len(st.session_state.session_log)} captures")
                 
                 # Generate comparison report
@@ -4964,7 +4968,7 @@ def main():
         
         with col_d3:
             # Calculate avg_beta for summary
-            if st.session_state.session_log:
+            if st.session_state.get("session_log"):
                 avg_beta = sum(e.get("reliability_index", 0.0) for e in st.session_state.session_log) / len(st.session_state.session_log)
             else:
                 avg_beta = 0.0
