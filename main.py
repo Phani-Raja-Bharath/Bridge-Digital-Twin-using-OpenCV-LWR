@@ -14,7 +14,8 @@ import requests
 from scipy import stats
 import base64
 import hashlib
-import os   
+import os, tempfile
+os.environ["YOLO_CONFIG_DIR"] = os.path.join(tempfile.gettempdir(), "Ultralytics")   
 import json
 
 # Configure logging
@@ -736,7 +737,7 @@ def capture_frame(stream_url: str, timeout: int = 10) -> Optional[np.ndarray]:
                     '-g',  # Get URL only
                     stream_url
                 ]
-                yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=10, text=True)
+                yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=30, text=True)
                 
                 if yt_result.returncode == 0 and yt_result.stdout.strip():
                     stream_url = yt_result.stdout.strip().split('\n')[0]  # Get first URL
@@ -753,12 +754,24 @@ def capture_frame(stream_url: str, timeout: int = 10) -> Optional[np.ndarray]:
         
         # Use ffmpeg to capture frame
         cmd = [
-            'ffmpeg', '-loglevel', 'error',
-            '-i', stream_url,
-            '-vframes', '1',
-            '-f', 'image2pipe',
-            '-vcodec', 'png', '-'
+            "ffmpeg",
+            "-loglevel", "error",
+
+            # ↓↓↓ reduce probing / startup latency
+            "-probesize", "32",
+            "-analyzeduration", "0",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+
+            # ↓↓↓ avoid hanging too long on slow network
+            "-rw_timeout", "5000000",   # microseconds = 5s
+
+            "-i", stream_url,
+            "-vframes", "1",
+            "-f", "image2pipe",
+            "-vcodec", "png", "-"
         ]
+
         result = subprocess.run(cmd, capture_output=True, timeout=timeout)
         
         if result.returncode == 0 and result.stdout:
