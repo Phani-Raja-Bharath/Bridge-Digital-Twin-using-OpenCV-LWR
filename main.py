@@ -1,7 +1,3 @@
-if "session_log" not in st.session_state:
-    st.session_state.session_log = []
-
-
 import streamlit as st
 import cv2
 import numpy as np
@@ -84,6 +80,9 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+
+if "session_log" not in st.session_state:
+    st.session_state.session_log = []
 
 # =============================================================================
 # 1) APP CONFIGURATION
