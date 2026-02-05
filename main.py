@@ -724,7 +724,7 @@ def calculate_environmental_stress(
 # 4) COMPUTER VISION / CAMERA PIPELINE
 # =============================================================================
 
-def capture_frame(stream_url: str, timeout: int = 10) -> Optional[np.ndarray]:
+def capture_frame(stream_url: str, timeout: int = 30) -> Optional[np.ndarray]:
     """Capture frame from HLS stream or YouTube using ffmpeg"""
     try:
         # Check if it's a YouTube URL
