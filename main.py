@@ -753,6 +753,15 @@ def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
                 logger.info(f"Downloading 1s video segment (lowest quality for speed)...")
                 yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=30, text=True)
                 
+                # Check for rate limiting errors
+                if '429' in yt_result.stderr or 'Too Many Requests' in yt_result.stderr:
+                    logger.error("YouTube rate limiting detected (HTTP 429). Please try again in a few minutes or use a different camera source.")
+                    return None
+                
+                if 'Sign in to confirm' in yt_result.stderr or 'not a bot' in yt_result.stderr:
+                    logger.error("YouTube bot detection triggered. This is common on cloud platforms. Consider using a direct HLS stream URL instead of YouTube.")
+                    return None
+                
                 # Check if video was downloaded
                 if os.path.exists(temp_video_path):
                     try:
@@ -775,14 +784,14 @@ def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
                             os.remove(temp_video_path)
                         return None
                 else:
-                    logger.error(f"yt-dlp did not download video segment. stderr: {yt_result.stderr}")
+                    logger.warning(f"yt-dlp did not download video segment. See error above for details.")
                     return None
                     
             except FileNotFoundError:
                 logger.error("yt-dlp not found. Please install: pip install yt-dlp")
                 return None
             except subprocess.TimeoutExpired:
-                logger.error(f"yt-dlp timed out after {timeout}s")
+                logger.error(f"yt-dlp timed out after 30s")
                 return None
             except Exception as e:
                 logger.error(f"yt-dlp error: {e}")
