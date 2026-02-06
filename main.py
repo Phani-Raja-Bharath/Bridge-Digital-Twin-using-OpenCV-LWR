@@ -110,7 +110,7 @@ class BridgeConfig:
 # Camera configurations
 CAMERAS = {
     "Peace Bridge - Canada Bound": {
-        "url": "https://youtu.be/DnUFAShZKus",
+        "url": "https://www.youtube.com/watch?v=DnUFAShZKus",
         "approaching_side": "right",
         "left_label": "USA Bound (PAST)",
         "right_label": "Canada Bound (LOAD)"
@@ -724,7 +724,7 @@ def calculate_environmental_stress(
 # 4) COMPUTER VISION / CAMERA PIPELINE
 # =============================================================================
 
-def capture_frame(stream_url: str, timeout: int = 30) -> Optional[np.ndarray]:
+def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
     """Capture frame from HLS stream or YouTube using ffmpeg"""
     try:
         # Check if it's a YouTube URL
@@ -737,7 +737,7 @@ def capture_frame(stream_url: str, timeout: int = 30) -> Optional[np.ndarray]:
                     '-g',  # Get URL only
                     stream_url
                 ]
-                yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=30, text=True)
+                yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=60, text=True)
                 
                 if yt_result.returncode == 0 and yt_result.stdout.strip():
                     stream_url = yt_result.stdout.strip().split('\n')[0]  # Get first URL
