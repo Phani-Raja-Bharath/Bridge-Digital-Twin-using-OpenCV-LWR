@@ -733,59 +733,50 @@ def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
         # Check if it's a YouTube URL
         if 'youtube.com' in stream_url or 'youtu.be' in stream_url:
             try:
-                # Use yt-dlp to download a single frame directly as a temporary file
-                # This avoids ffmpeg's HLS connection issues in cloud environments
+                # Download a short video segment and extract a frame
+                # This works for both regular videos and live streams
                 import tempfile
-                temp_image_path = tempfile.mktemp(suffix='.jpg')
+                temp_video_path = tempfile.mktemp(suffix='.mp4')
                 
                 yt_dlp_cmd = [
                     'yt-dlp',
                     '--no-playlist',
                     '--quiet',
                     '--no-warnings',
-                    # Download a very short segment and extract one frame
-                    '--external-downloader', 'ffmpeg',
-                    '--external-downloader-args', 'ffmpeg:-ss 00:00:00 -t 1',
-                    '--output', temp_image_path,
-                    # Get a thumbnail as fallback
-                    '--write-thumbnail',
-                    '--skip-download',
+                    '-f', 'best[ext=mp4]/best',
+                    # Download only 2 seconds
+                    '--downloader', 'ffmpeg',
+                    '--downloader-args', 'ffmpeg:-t 2',
+                    '-o', temp_video_path,
                     stream_url
                 ]
                 
-                logger.info(f"Using yt-dlp to capture frame from YouTube stream...")
+                logger.info(f"Downloading short video segment from YouTube stream...")
                 yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=timeout, text=True)
                 
-                # Try to find the downloaded thumbnail
-                thumbnail_path = None
-                if os.path.exists(temp_image_path):
-                    thumbnail_path = temp_image_path
-                else:
-                    # Look for .jpg or .webp thumbnail files
-                    temp_dir = os.path.dirname(temp_image_path)
-                    temp_base = os.path.splitext(os.path.basename(temp_image_path))[0]
-                    for ext in ['.jpg', '.webp', '.png']:
-                        candidate = os.path.join(temp_dir, temp_base + ext)
-                        if os.path.exists(candidate):
-                            thumbnail_path = candidate
-                            break
-                
-                if thumbnail_path and os.path.exists(thumbnail_path):
+                # Check if video was downloaded
+                if os.path.exists(temp_video_path):
                     try:
-                        image = Image.open(thumbnail_path)
-                        frame = np.array(image)
-                        if len(frame.shape) == 3 and frame.shape[2] == 3:
-                            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                        logger.info(f"Successfully captured frame: {frame.shape}")
-                        os.remove(thumbnail_path)  # Clean up
-                        return frame
+                        # Use OpenCV to read the first frame
+                        cap = cv2.VideoCapture(temp_video_path)
+                        ret, frame = cap.read()
+                        cap.release()
+                        
+                        if ret and frame is not None:
+                            logger.info(f"Successfully captured frame from video segment: {frame.shape}")
+                            os.remove(temp_video_path)  # Clean up
+                            return frame
+                        else:
+                            logger.error(f"Failed to read frame from video segment")
+                            os.remove(temp_video_path)
+                            return None
                     except Exception as e:
-                        logger.error(f"Failed to read downloaded frame: {e}")
-                        if os.path.exists(thumbnail_path):
-                            os.remove(thumbnail_path)
+                        logger.error(f"Failed to extract frame from video: {e}")
+                        if os.path.exists(temp_video_path):
+                            os.remove(temp_video_path)
                         return None
                 else:
-                    logger.error(f"yt-dlp did not produce a frame file. Output: {yt_result.stderr}")
+                    logger.error(f"yt-dlp did not download video segment. stderr: {yt_result.stderr}")
                     return None
                     
             except FileNotFoundError:
@@ -830,6 +821,7 @@ def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
     except Exception as e:
         logger.error(f"Frame capture error: {type(e).__name__}: {e}")
         return None
+
 
 
 def compute_fatigue_damage(stress_series: list, m: int = 3, C: float = 1e12) -> Tuple[float, float, float]:
