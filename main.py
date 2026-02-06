@@ -741,18 +741,17 @@ def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
                 yt_dlp_cmd = [
                     'yt-dlp',
                     '--no-playlist',
-                    '--quiet',
-                    '--no-warnings',
-                    '-f', 'best[ext=mp4]/best',
-                    # Download only 2 seconds
+                    # Use worst quality for faster download on cloud
+                    '-f', 'worst[ext=mp4]/worst/best[height<=360]',
+                    # Download only 1 second to minimize download time
                     '--downloader', 'ffmpeg',
-                    '--downloader-args', 'ffmpeg:-t 2',
+                    '--downloader-args', 'ffmpeg:-t 1 -loglevel error',
                     '-o', temp_video_path,
                     stream_url
                 ]
                 
-                logger.info(f"Downloading short video segment from YouTube stream...")
-                yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=timeout, text=True)
+                logger.info(f"Downloading 1s video segment (lowest quality for speed)...")
+                yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=30, text=True)
                 
                 # Check if video was downloaded
                 if os.path.exists(temp_video_path):
