@@ -21,3 +21,4 @@ yt-dlp[default]
 
 # Utilities
 requests>=2.31
+imageio-ffmpeg==0.5.2
