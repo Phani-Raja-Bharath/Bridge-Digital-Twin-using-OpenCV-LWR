@@ -728,49 +728,82 @@ def calculate_environmental_stress(
 # =============================================================================
 
 def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
-    """Capture frame from HLS stream or YouTube using ffmpeg"""
+    """Capture frame from HLS stream or YouTube using yt-dlp + ffmpeg"""
     try:
         # Check if it's a YouTube URL
         if 'youtube.com' in stream_url or 'youtu.be' in stream_url:
             try:
-                # Use yt-dlp to get the direct stream URL
+                # Use yt-dlp to download a single frame directly as a temporary file
+                # This avoids ffmpeg's HLS connection issues in cloud environments
+                import tempfile
+                temp_image_path = tempfile.mktemp(suffix='.jpg')
+                
                 yt_dlp_cmd = [
                     'yt-dlp',
-                    '-f', 'best[ext=mp4]',  # Get best quality mp4
-                    '-g',  # Get URL only
+                    '--no-playlist',
+                    '--quiet',
+                    '--no-warnings',
+                    # Download a very short segment and extract one frame
+                    '--external-downloader', 'ffmpeg',
+                    '--external-downloader-args', 'ffmpeg:-ss 00:00:00 -t 1',
+                    '--output', temp_image_path,
+                    # Get a thumbnail as fallback
+                    '--write-thumbnail',
+                    '--skip-download',
                     stream_url
                 ]
-                yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=60, text=True)
                 
-                if yt_result.returncode == 0 and yt_result.stdout.strip():
-                    stream_url = yt_result.stdout.strip().split('\n')[0]  # Get first URL
-                    logger.info(f"Resolved YouTube URL to: {stream_url[:100]}...")
+                logger.info(f"Using yt-dlp to capture frame from YouTube stream...")
+                yt_result = subprocess.run(yt_dlp_cmd, capture_output=True, timeout=timeout, text=True)
+                
+                # Try to find the downloaded thumbnail
+                thumbnail_path = None
+                if os.path.exists(temp_image_path):
+                    thumbnail_path = temp_image_path
                 else:
-                    logger.error(f"yt-dlp failed: {yt_result.stderr}")
+                    # Look for .jpg or .webp thumbnail files
+                    temp_dir = os.path.dirname(temp_image_path)
+                    temp_base = os.path.splitext(os.path.basename(temp_image_path))[0]
+                    for ext in ['.jpg', '.webp', '.png']:
+                        candidate = os.path.join(temp_dir, temp_base + ext)
+                        if os.path.exists(candidate):
+                            thumbnail_path = candidate
+                            break
+                
+                if thumbnail_path and os.path.exists(thumbnail_path):
+                    try:
+                        image = Image.open(thumbnail_path)
+                        frame = np.array(image)
+                        if len(frame.shape) == 3 and frame.shape[2] == 3:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        logger.info(f"Successfully captured frame: {frame.shape}")
+                        os.remove(thumbnail_path)  # Clean up
+                        return frame
+                    except Exception as e:
+                        logger.error(f"Failed to read downloaded frame: {e}")
+                        if os.path.exists(thumbnail_path):
+                            os.remove(thumbnail_path)
+                        return None
+                else:
+                    logger.error(f"yt-dlp did not produce a frame file. Output: {yt_result.stderr}")
                     return None
+                    
             except FileNotFoundError:
                 logger.error("yt-dlp not found. Please install: pip install yt-dlp")
+                return None
+            except subprocess.TimeoutExpired:
+                logger.error(f"yt-dlp timed out after {timeout}s")
                 return None
             except Exception as e:
                 logger.error(f"yt-dlp error: {e}")
                 return None
         
-        # Use ffmpeg to capture frame
+        # For non-YouTube URLs, use ffmpeg directly
         cmd = [
             "ffmpeg",
             "-loglevel", "error",
-
-            # ↓↓↓ reduce probing / startup latency (adjusted for reliability)
             "-probesize", "10M",
             "-analyzeduration", "5000000",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-strict", "experimental",
-
-            # ↓↓↓ robust network handling for HLS
-            "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36\r\n",
-            "-rw_timeout", "20000000",   # 20s (microseconds)
-
             "-i", stream_url,
             "-vframes", "1",
             "-f", "image2pipe",
@@ -797,6 +830,7 @@ def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
     except Exception as e:
         logger.error(f"Frame capture error: {type(e).__name__}: {e}")
         return None
+
 
 def compute_fatigue_damage(stress_series: list, m: int = 3, C: float = 1e12) -> Tuple[float, float, float]:
     """
