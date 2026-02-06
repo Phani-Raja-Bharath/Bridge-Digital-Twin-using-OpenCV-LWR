@@ -765,9 +765,11 @@ def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
             "-analyzeduration", "5000000",
             "-fflags", "nobuffer",
             "-flags", "low_delay",
+            "-strict", "experimental",
 
-            # ↓↓↓ avoid hanging too long on slow network
-            "-rw_timeout", "5000000",   # microseconds = 5s
+            # ↓↓↓ robust network handling for HLS
+            "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36\r\n",
+            "-rw_timeout", "20000000",   # 20s (microseconds)
 
             "-i", stream_url,
             "-vframes", "1",
