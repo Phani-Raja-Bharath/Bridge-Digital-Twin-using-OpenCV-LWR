@@ -15,7 +15,10 @@ from scipy import stats
 import base64
 import hashlib
 import os, tempfile
-os.environ["YOLO_CONFIG_DIR"] = os.path.join(tempfile.gettempdir(), "Ultralytics")   
+# Use a local directory for YOLO config to avoid permission issues
+YOLO_DIR = os.path.join(os.getcwd(), ".yolo_cache")
+os.makedirs(YOLO_DIR, exist_ok=True)
+os.environ["YOLO_CONFIG_DIR"] = YOLO_DIR
 import json
 
 # Configure logging
@@ -757,9 +760,9 @@ def capture_frame(stream_url: str, timeout: int = 60) -> Optional[np.ndarray]:
             "ffmpeg",
             "-loglevel", "error",
 
-            # ↓↓↓ reduce probing / startup latency
-            "-probesize", "32",
-            "-analyzeduration", "0",
+            # ↓↓↓ reduce probing / startup latency (adjusted for reliability)
+            "-probesize", "10M",
+            "-analyzeduration", "5000000",
             "-fflags", "nobuffer",
             "-flags", "low_delay",
 
